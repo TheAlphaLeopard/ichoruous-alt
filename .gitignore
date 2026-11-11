@@ -1,16 +1,16 @@
 # dependencies
 node_modules
 
-# next.js build output (static export lands in /out)
-/.next
-/out
+# next.js build output (the port's static export lands in port/out)
+port/.next
+port/out
 
 # large raw recompilation artifacts — the .gz variants are what ship
-/public/gex/game.wasm
-/public/gex/image.bin
+port/public/gex/game.wasm
+port/public/gex/image.bin
 
-# user's original game files (not distributable — add your own under upload/)
-/upload
+# user's original game files (not distributable — add your own under port/upload/)
+port/upload
 
 # local deliverables / scratch
 /download
@@ -32,7 +32,7 @@ server.log
 .zscripts
 
 # zips staged for browser download via the dev/preview server
-/public/_downloads
+port/public/_downloads
 
 # sandbox-only transport service
 /mini-services
