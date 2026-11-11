@@ -1,0 +1,38 @@
+# dependencies
+node_modules
+
+# next.js build output (static export lands in /out)
+/.next
+/out
+
+# large raw recompilation artifacts — the .gz variants are what ship
+/public/gex/game.wasm
+/public/gex/image.bin
+
+# user's original game files (not distributable — add your own under upload/)
+/upload
+
+# local deliverables / scratch
+/download
+/skills
+/repos
+
+# logs, env, misc
+*.log
+.env*
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts
+dev.log
+server.log
+
+# tooling
+.claude
+.z-ai-config
+.zscripts
+
+# zips staged for browser download via the dev/preview server
+/public/_downloads
+
+# sandbox-only transport service
+/mini-services
