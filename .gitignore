@@ -1,38 +1,15 @@
-# dependencies
+# dependencies — there are none at runtime, this is for dev tooling only
 node_modules
 
-# next.js build output (the port's static export lands in port/out)
-port/.next
-port/out
+# extractor input (your own copy of the game) and its scratch output
+/upload
+/out
 
-# large raw recompilation artifacts — the .gz variants are what ship
-port/public/gex/game.wasm
-port/public/gex/image.bin
-
-# user's original game files (not distributable — add your own under port/upload/)
-port/upload
-
-# local deliverables / scratch
-/download
-/skills
-/repos
+# large raw recompilation artifacts — only the .gz variants ship
+/gex/game.wasm
+/gex/image.bin
 
 # logs, env, misc
 *.log
 .env*
 .DS_Store
-*.tsbuildinfo
-next-env.d.ts
-dev.log
-server.log
-
-# tooling
-.claude
-.z-ai-config
-.zscripts
-
-# zips staged for browser download via the dev/preview server
-port/public/_downloads
-
-# sandbox-only transport service
-/mini-services
