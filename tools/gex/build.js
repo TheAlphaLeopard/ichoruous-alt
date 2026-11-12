@@ -5,8 +5,8 @@ import { Lifter } from "./lift.ts.js";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const EXE = `${HERE}/../../upload/Ichorous.exe`;
-const OUTDIR = `${HERE}/../../public/gex`;
+const EXE = process.env.ICHOROUS_EXE ?? `${HERE}/../../upload/Ichorous.exe`;
+const OUTDIR = process.env.GEX_OUT ?? path.join(HERE, "..", "..", "gex");
 const LIMIT = process.argv[2] ? parseInt(process.argv[2], 10) : 0;
 fs.mkdirSync(OUTDIR, { recursive: true });
 console.time("registry");
@@ -19,10 +19,18 @@ console.timeEnd("image");
 if (LIMIT > 0) reg.fns = reg.fns.slice(0, LIMIT);
 const dv = new DataView(mem.buffer);
 console.time("lift");
+// Two passes. The wasm index of a lifted function is imports.length + i, and
+// imports are created lazily as call targets are seen, so the whole import set
+// has to be known before the first body is emitted. Pass one discovers it.
+const probe = new Lifter(reg, mem, dv);
+probe.liftAll();
 const lifter = new Lifter(reg, mem, dv);
+const nImports = lifter.precreateImports([...probe.abiCallCounts.keys()]);
 const okCount = lifter.liftAll();
 console.timeEnd("lift");
+console.log("pre-created", nImports, "imports (probe saw", probe.abiCallCounts.size, "abi targets)");
 console.log("lifted:", okCount, "/", reg.fns.length, "failed:", lifter.liftedFail);
+console.log("internal call sites:", lifter.nInternalCalls ?? 0, " abi call sites:", lifter.nAbiCalls ?? 0, " imports:", lifter.wasm.imports.length);
 for (const e of lifter.errors.slice(0, 3)) console.log("  ERR", e.fn, "::", e.msg);
 if (lifter.errors.length) {
   lifter._firstStack = lifter.errors[0];

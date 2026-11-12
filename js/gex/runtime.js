@@ -487,6 +487,7 @@ class GMRunner {
       }
       return [0, 0];
     };
+    this.abiCounts = new Map();
     const wrapped = {};
     for (const [k, fn] of Object.entries(impl)) {
       wrapped[k] = (a, b, c, d, e) => {
@@ -494,6 +495,7 @@ class GMRunner {
           self.abiTrace.push(k + "(" + Number(a) + "," + Number(b) + "," + Number(c) + ")");
           if (self.abiTrace.length > 40) self.abiTrace.shift();
         }
+        if (self.countABI) self.abiCounts.set(k, (self.abiCounts.get(k) ?? 0) + 1);
         try {
           const r = fn(Number(a), Number(b), Number(c), Number(d), Number(e));
           return [BigInt(Math.trunc(r[0])), r[1]];

@@ -160,3 +160,72 @@ with lifted code — the same trick
 is the obvious next thing to try; the open questions are how many of them lift
 cleanly and whether the ones that walk real `CInstance` structures behave
 better or worse than a shim that knows the guest's own object model.
+
+### Answered: it lifts, and it is a regression (measured)
+
+`tools/gex/build-runner.js` adds the runner addresses to `reg.fns` and walks to
+a fixed point. It works mechanically:
+
+| | shipped | + runner fns |
+|---|---|---|
+| functions in the module | 5555 | 5876–5900 |
+| lifted / failed | 5555 / 0 | 5876 / 0 |
+| distinct ABI imports | 422 | 229 |
+| direct (internal) call sites | 7117 | 33 594 |
+| `game.wasm` | 107.18 MB | 111.5 MB |
+| boot scripts | 490 ok, 8 threw, 2.6 s | 379 ok, 119 threw, 203 s |
+| 200 frames | 0 throws, p50 0.0 ms | 0 throws, p50 0.0 ms |
+
+Frames are unaffected; boot is both slower and less successful. Lifting whole
+runner functions is not the shortcut — the shims survive because they encode
+knowledge of the guest's object model that lifted runner code does not have.
+`build-runner.js` is kept because it is the tool that found the next section.
+
+### Two bugs in how the lifter emits a direct call
+
+Chasing that regression turned up two defects in `lift.js` that are present in
+the shipped `gex/game.wasm` as well. Both concern the direct `call` to a target
+that is in `reg.fns` (the `abi.*` import path was fine).
+
+1. **The index was short by the number of imports.** Wasm lays imports out
+   first, so `reg.fns[i]` lives at index `imports.length + i`
+   (`wasm.js#addFunc` returns exactly that). The call sites used
+   `fnIndexByVa`, which is the plain array index `i`. Imports are created
+   lazily as call targets are seen, so `internalFnIdx()` now adds the base,
+   `precreateImports()` creates every import before the first body is emitted,
+   and `liftAll()` throws if the import count moves afterwards. Without the
+   pre-creation the base changes under already-emitted bodies.
+
+2. **The fifth argument shifted the arguments by one.** Lifted functions take
+   four parameters (rcx, rdx, r8, r9) and read rsp from a global; the ABI
+   imports take five, the fifth being rsp, because they run in JS. The emitter
+   pushed five in both cases. A four-parameter callee then receives
+   **rdx, r8, r9, rsp** instead of rcx, rdx, r8, r9 — wasm takes the *last* N
+   values pushed, so the extra value at the bottom drops the real first
+   argument. Verified with a four-line module:
+
+   ```
+   local.get 0..3; global.get $rsp; call $callee   ;; callee sees p0 = 2, not 1
+   ```
+
+   (It did not trap: extra values below the stack are legal, and every block
+   ends in a `br`, which discards them. That is why this was invisible.)
+
+Both are fixed in `tools/gex/lift.js`. The rebuilt module is **not** shipped:
+with correct direct calls the 2 299 GML→GML call sites execute for the first
+time and mostly die with `memory access out of bounds` (boot falls to 71 ok /
+427 threw). In other words the scoreboard we have been tracking was flattered —
+a direct call used to land `imports.length` functions early in `reg.fns`, or on
+an ABI import whose shim returned `[0n, 0]`, and garbage that does not throw
+counts as "ok". The room does get further with the fix (11 instances instead of
+9), so the work is real; the next problem is whatever those scripts touch that
+neither the shims nor the image model support yet.
+
+### Tooling added for this
+
+| tool | what it does |
+|---|---|
+| `tools/gex/build-runner.js` | lifts runner functions into the module |
+| `tools/boot-trace.mjs` | runs the boot scripts one at a time, printing each name before it starts and a JS stack on the first error (`STACK=1`) |
+| `tools/abi-count.mjs` | runs one guest function with per-ABI-import call counts |
+| `GMRunner.countABI` | fills `runner.abiCounts` with a call count per ABI import |
