@@ -126,6 +126,7 @@ class GMRunner {
     // pointers the running script was entered with
     this.members = /* @__PURE__ */ new Map();
     this.unknownInsts = /* @__PURE__ */ new Map();
+    this.structIds = /* @__PURE__ */ new Map();
     this.unknownCallTargets = /* @__PURE__ */ new Map();
     this.curSelfPtr = 0;
     this.curOtherPtr = 0;
@@ -295,16 +296,16 @@ class GMRunner {
       }
       return [0, 0];
     };
+    // Call a GML function: (self, other, RValue *result, argc, callee, args).
+    // The callee slot has three shapes - a plain cell id for a built-in, a
+    // pointer to an RValue holding a GMS 2.3 method, and occasionally a raw
+    // code address - so it has to be resolved before it is dispatched.
     impl.f140e634e0 = (rcx, rdx, r8, r9, rsp) => {
-      const id = stackArg(rsp, 4);
-      const argsPtr = stackArg(rsp, 5);
-      self.dispatchFunction(rcx, rdx, r8, r9, id, argsPtr);
+      self.dispatchFunction(rcx, rdx, r8, r9, self.callTargetId(stackArg(rsp, 4)), stackArg(rsp, 5));
       return [0, 0];
     };
     impl.f140e63610 = (rcx, rdx, r8, r9, rsp) => {
-      const id = stackArg(rsp, 4);
-      const argsPtr = stackArg(rsp, 5);
-      self.dispatchFunction(rcx, rdx, r8, r9, id, argsPtr);
+      self.dispatchFunction(rcx, rdx, r8, r9, self.callTargetId(stackArg(rsp, 4)), stackArg(rsp, 5));
       return [0, 0];
     };
     impl.f140e645a0 = (rcx, rdx, r8) => {
@@ -315,11 +316,15 @@ class GMRunner {
       g.writeRV(rcx, { v: p, flags: 8, t: T_OBJECT });
       return [0, 0];
     };
-    impl.f140e87440 = (rcx, rdx, _r8, r9, rsp) => {
-      const argc = stackArg(rsp, 4);
-      const selfInst = stackArg(rsp, 5);
-      self.dispatchFunction(selfInst, 0, rcx, argc, rdx | 0, r9);
-      return [0, 0];
+    // `a.b` read where the left-hand side is already an instance pointer: the
+    // sibling of f140e87170 that f140e86fa0 is to f140e87930. Arguments are
+    // (instance, member cell id, array index or 0x80000000, RValue *out); the
+    // byte it returns is "found". Note it takes no stack arguments - an earlier
+    // version of this shim read two, which produced the "dispatch: bad id"
+    // flood, since those slots hold something else entirely.
+    impl.f140e87440 = (rcx, rdx, _r8, r9) => {
+      self.getMember(rcx >>> 0, rdx | 0, r9);
+      return [1, 0];
     };
     impl.f140e491e0 = (rcx) => {
       const t = rvType(rcx);
@@ -482,6 +487,7 @@ class GMRunner {
       }
       return [0, 0];
     };
+    this.abiCounts = new Map();
     const wrapped = {};
     for (const [k, fn] of Object.entries(impl)) {
       wrapped[k] = (a, b, c, d, e) => {
@@ -489,6 +495,7 @@ class GMRunner {
           self.abiTrace.push(k + "(" + Number(a) + "," + Number(b) + "," + Number(c) + ")");
           if (self.abiTrace.length > 40) self.abiTrace.shift();
         }
+        if (self.countABI) self.abiCounts.set(k, (self.abiCounts.get(k) ?? 0) + 1);
         try {
           const r = fn(Number(a), Number(b), Number(c), Number(d), Number(e));
           return [BigInt(Math.trunc(r[0])), r[1]];
@@ -835,9 +842,48 @@ class GMRunner {
         return Number(g.dv.getBigInt64(rvPtr, true));
     }
   }
+  // Index of the ds_map standing in for a struct. Structs arrive either as an
+  // object RValue (a pointer) or as the numeric handle the shim handed out.
+  structKey(rvPtr) {
+    const r = this.guest.readRV(rvPtr);
+    if (r.t === T_OBJECT && r.v) {
+      let id = this.structIds.get(r.v);
+      if (id === void 0) {
+        id = this.dsNewMap();
+        this.structIds.set(r.v, id);
+      }
+      return id;
+    }
+    return this.rvToNum(r) | 0;
+  }
+  // Resolve the callee argument of f140e634e0 / f140e63610 to a cell id, or
+  // -1 when it names nothing we can call. A cell id is small; anything larger
+  // is a pointer to an RValue, and only an int32/int64 RValue holding a valid
+  // cell id is callable. Everything else is a method value this shim has not
+  // populated yet (structs have no methods until the struct ABI exists), and
+  // guessing an id from it - the old behaviour - dispatched nonsense.
+  callTargetId(v) {
+    if (v >= 0 && v < this.meta.cellNames.length) return v;
+    const p = v >>> 0;
+    if (p && p + 16 <= this.guest.u8.length) {
+      const kind = this.guest.dv.getUint32(p + 12, true) & 16777215;
+      if (kind === T_INT32 || kind === T_DOUBLE || kind === T_BOOL) {
+        const n = kind === T_DOUBLE || kind === T_BOOL
+          ? Math.trunc(this.guest.dv.getFloat64(p, true))
+          : this.guest.dv.getInt32(p, true);
+        if (n > 0 && n < this.meta.cellNames.length && Math.trunc(this.guest.dv.getFloat64(p, true)) === n) return n;
+      }
+    }
+    return -1;
+  }
   dispatchFunction(selfPtr, otherPtr, resultPtr, argc, id, argsPtr) {
     try {
       this.checkBudget("dispatch");
+      if (id < 0) {
+        this.log("dispatch: uncallable callee");
+        this.guest.writeRVUndef(resultPtr);
+        return;
+      }
       const outerSelf = this.curSelfPtr, outerOther = this.curOtherPtr;
       if (selfPtr) this.curSelfPtr = selfPtr;
       if (otherPtr) this.curOtherPtr = otherPtr;
@@ -1094,6 +1140,28 @@ class GMRunner {
       }
       case "instance_change":
         return;
+      case "game_get_speed":
+        // 0 = fps, 1 = microseconds per frame. The host drives frames at 60.
+        outD(num(0) === 1 ? 1e6 / 60 : 60);
+        return;
+      case "game_set_speed":
+        return;
+      case "font_get_size": {
+        // Real glyph metrics need the font atlas; the game only compares sizes.
+        const f = num(0) | 0;
+        outD(f >= 0 && f < this.sprites.length ? 12 : 12);
+        return;
+      }
+      case "asset_get_index": {
+        const nm = str(0);
+        let found = -1;
+        for (let i = 0; i < this.objects.length; i++) if (this.objects[i].name === nm) { found = i; break; }
+        if (found < 0) {
+          for (let i = 0; i < this.sprites.length; i++) if (this.sprites[i].name === nm) { found = i; break; }
+        }
+        outI(found);
+        return;
+      }
       case "room_goto":
         this.gotoRoom(num(0) | 0);
         outD(0);
@@ -1355,6 +1423,18 @@ class GMRunner {
       case "ds_map_find_first": {
         const m = this.dsMaps.get(num(0) | 0);
         outS(m ? [...m.keys()][0] ?? "" : "");
+        return;
+      }
+      case "ds_map_set": {
+        const m = this.dsMaps.get(num(0) | 0);
+        if (m) m.set(this.dsKey(arg(1)), g.readRV(arg(2)));
+        return;
+      }
+      case "ds_map_add_list":
+      case "ds_map_add_map": {
+        const m = this.dsMaps.get(num(0) | 0);
+        if (m) m.set(this.dsKey(arg(1)), g.readRV(arg(2)));
+        outB(true);
         return;
       }
       case "ds_grid_create":
@@ -1628,6 +1708,73 @@ class GMRunner {
       case "instanceof":
         outB(false);
         return;
+      case "is_numeric": {
+        const t2 = g.readRV(arg(0)).t;
+        outB(t2 === T_DOUBLE || t2 === T_BOOL || t2 === T_INT32);
+        return;
+      }
+      case "is_struct":
+        outB(g.readRV(arg(0)).t === T_OBJECT);
+        return;
+      case "is_ptr":
+        outB(g.readRV(arg(0)).t === T_PTR);
+        return;
+      case "is_int32":
+        outB(g.readRV(arg(0)).t === T_INT32);
+        return;
+      case "is_int64":
+        outB(g.readRV(arg(0)).t === T_INT32 || g.readRV(arg(0)).t === T_DOUBLE);
+        return;
+      case "is_nan":
+        outB(Number.isNaN(num(0)));
+        return;
+      case "is_infinity":
+        outB(!Number.isFinite(num(0)) && !Number.isNaN(num(0)));
+        return;
+      case "is_instanceof":
+        outB(false);
+        return;
+      case "string": {
+        const r = g.readRV(arg(0));
+        outS(r.t === T_STRING ? this.guest.readString(r.v) : r.t === T_UNDEF ? "undefined" : String(this.rvToNum(r)));
+        return;
+      }
+      case "array_foreach": {
+        // The callback is a method value this shim cannot call yet; the result
+        // is the array itself, which is what GML returns.
+        const a = this.hostArrays.get(g.readRV(arg(0)).v);
+        if (a) g.writeRV(resultPtr, g.readRV(arg(0)));
+        else g.writeRVUndef(resultPtr);
+        return;
+      }
+      case "variable_struct_get":
+      case "struct_get_from_hash": {
+        const m = this.dsMaps.get(this.structKey(arg(0)));
+        const v = m?.get(this.dsKey(arg(1)));
+        if (v) g.writeRV(resultPtr, v);
+        else g.writeRVUndef(resultPtr);
+        return;
+      }
+      case "variable_struct_set": {
+        const m = this.dsMaps.get(this.structKey(arg(0)));
+        if (m) m.set(this.dsKey(arg(1)), g.readRV(arg(2)));
+        return;
+      }
+      case "variable_struct_exists": {
+        const m = this.dsMaps.get(this.structKey(arg(0)));
+        outB(m ? m.has(this.dsKey(arg(1))) : false);
+        return;
+      }
+      case "variable_struct_remove": {
+        const m = this.dsMaps.get(this.structKey(arg(0)));
+        if (m) m.delete(this.dsKey(arg(1)));
+        return;
+      }
+      case "variable_struct_names_count": {
+        const m = this.dsMaps.get(this.structKey(arg(0)));
+        outD(m ? m.size : 0);
+        return;
+      }
       case "struct_get": {
         const m = this.dsMaps.get(num(0) | 0);
         const v = m?.get("s:" + str(1));

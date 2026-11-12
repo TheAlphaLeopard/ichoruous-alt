@@ -92,9 +92,13 @@ class Lifter {
         if (this.errors.length < 50) this.errors.push({ fn: f.name, msg: String(e.message ?? e).slice(0, 220) + "\nSTACK:" + (e.stack ?? "").split("\n").slice(1, 5).map((s) => s.trim().slice(0, 90)).join(" | ") });
       }
     }
+    if (this._importsFixed !== void 0 && this.wasm.imports.length !== this._importsFixed) {
+      throw new Error(`import count grew from ${this._importsFixed} to ${this.wasm.imports.length} during liftAll; call sites emitted before that are off`);
+    }
     return this.liftedOk;
   }
   liftFunction(f) {
+    this.curFnVa = f.va;
     const blocks = this.discoverBlocks(f);
     if (!blocks.has(f.va)) throw new Error("no entry block");
     const blockList = [...blocks.values()];
@@ -212,7 +216,15 @@ class Lifter {
           for (const t of entries) queue.push(t);
           break;
         }
-        if (ins.op === "call") this.callTargets.add(Number(ins.o[0].v));
+        if (ins.op === "call") {
+          const t = Number(ins.o[0].v);
+          this.callTargets.add(t);
+          if (this.callEdges) {
+            let e = this.callEdges.get(this.curFnVa);
+            if (!e) this.callEdges.set(this.curFnVa, e = new Set());
+            e.add(t);
+          }
+        }
         if (ins.op === "icall") {
           const o = ins.o[0];
           if (o.k === "mem" && o.m.base !== void 0 && o.m.index === void 0) this.icallDisps.set(o.m.disp, (this.icallDisps.get(o.m.disp) ?? 0) + 1);
@@ -1096,6 +1108,8 @@ class Lifter {
       }
       case "call": {
         const t = Number(o0.v);
+        const gfn = L.fnByVa.get(t);
+        const idx = gfn !== void 0 ? L.internalFnIdx(gfn) : L.abiImportFor(t);
         e(OP.global_get);
         u(RSPG);
         i64c(8);
@@ -1106,10 +1120,17 @@ class Lifter {
         lg(1);
         lg(2);
         lg(3);
-        e(OP.global_get);
-        u(RSPG);
-        const gfn = L.fnByVa.get(t);
-        const idx = gfn !== void 0 ? L.fnIndexByVa.get(gfn.va) : L.abiImportFor(t);
+        // Only the five-parameter ABI imports take rsp as an argument; a
+        // lifted callee takes four parameters and reads rsp from the global.
+        // Pushing it anyway silently shifts every argument by one, because an
+        // engine takes the last N values pushed: the callee would see
+        // rdx, r8, r9, rsp instead of rcx, rdx, r8, r9.
+        if (gfn === void 0) {
+          e(OP.global_get);
+          u(RSPG);
+        }
+        if (gfn !== void 0) this.nInternalCalls = (this.nInternalCalls ?? 0) + 1;
+        else this.nAbiCalls = (this.nAbiCalls ?? 0) + 1;
         e(OP.call);
         u(idx);
         ls(XLO + 0);
@@ -1687,6 +1708,8 @@ class Lifter {
       case "ijmp": {
         if (ins.op === "call") {
           const t = Number(o0.v);
+          const gfn = L.reg.fnByVa.get(t);
+          const idx = gfn ? L.internalFnIdx(gfn) : L.abiImportFor(t);
           e(OP.global_get);
           u(RSPG);
           i64c(8);
@@ -1697,10 +1720,13 @@ class Lifter {
           lg(1);
           lg(2);
           lg(3);
-          e(OP.global_get);
-          u(RSPG);
-          const gfn = L.reg.fnByVa.get(t);
-          const idx = gfn ? L.fnIndexByVa.get(gfn.va) : L.abiImportFor(t);
+          // see the note in the non-terminator "call" case
+          if (!gfn) {
+            e(OP.global_get);
+            u(RSPG);
+          }
+          if (gfn) this.nInternalCalls = (this.nInternalCalls ?? 0) + 1;
+          else this.nAbiCalls = (this.nAbiCalls ?? 0) + 1;
           e(OP.call);
           u(idx);
           ls(XLO + 0);
@@ -1718,6 +1744,25 @@ class Lifter {
       default:
         throw new Error(`unhandled op "${ins.op}" @0x${va.toString(16)}`);
     }
+  }
+  // Wasm function indices are imports first, then locally defined functions, so
+  // the index of reg.fns[i] is imports.length + i. Imports are created lazily
+  // while lifting, so every one of them has to exist before the first function
+  // is emitted or the indices baked into earlier bodies are off by however many
+  // imports appear later. Call precreateImports() before liftAll().
+  internalFnIdx(f) {
+    return this.wasm.imports.length + this.fnIndexByVa.get(f.va);
+  }
+  precreateImports(abiVas = []) {
+    this.icallRegImportIdx();
+    this.icallImportIdx();
+    this.div128ImportIdx(true);
+    this.div128ImportIdx(false);
+    this.cvttsdImportIdx();
+    for (const va of abiVas) this.abiImportFor(va);
+    this._importsFixed = this.wasm.imports.length;
+    this.abiCallCounts.clear();
+    return this._importsFixed;
   }
   abiImportFor(va) {
     this.abiCallCounts.set(va, (this.abiCallCounts.get(va) ?? 0) + 1);
