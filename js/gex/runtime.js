@@ -122,6 +122,14 @@ class GMRunner {
     this.abiTrace = [];
     this.scopeStack = [];
     this.traceABI = false;
+    // member storage for `a.b` (see setMember/getMember) and the self/other
+    // pointers the running script was entered with
+    this.members = /* @__PURE__ */ new Map();
+    this.unknownInsts = /* @__PURE__ */ new Map();
+    this.unknownCallTargets = /* @__PURE__ */ new Map();
+    this.curSelfPtr = 0;
+    this.curOtherPtr = 0;
+    this.runnerErrors = /* @__PURE__ */ new Map();
     // --- watchdog -----------------------------------------------------------
     // Guest code can spin forever. Some loops call back into the host on every
     // iteration, and those we can abort cooperatively: the hot ABI entries
@@ -348,10 +356,14 @@ class GMRunner {
       return self.vtableCall(selfP, disp, rcx, rdx);
     };
     // Resolve an indirect call target. The guest stores some function pointers
-    // as RVAs (32-bit offsets from the image base) rather than full VAs, so a
-    // small value has to be rebased before it can be looked up.
+    // as RVAs (offsets from the image base) rather than full VAs, so a bare
+    // offset has to be rebased before it can be looked up. Note the image base
+    // itself has non-zero low 32 bits, so an already-absolute VA must have the
+    // base *subtracted*, never masked back down.
     const resolve = (fnptr) => {
-      let va = Number(fnptr) >>> 0;
+      let va = Number(fnptr);
+      if (!Number.isFinite(va) || va <= 0) return null;
+      if (va >= IMAGE_BASE) va -= IMAGE_BASE;
       if (va > 0 && va < IMAGE_BASE) va += IMAGE_BASE;
       const f = self.fnByVa(va);
       if (f) {
@@ -365,7 +377,16 @@ class GMRunner {
     };
     impl.icall_reg = (fnptr, rcx, rdx, r8, r9, rsp) => {
       const target = resolve(fnptr);
-      if (!target) throw new Error("icall_reg: unknown fn ptr 0x" + (Number(fnptr) >>> 0).toString(16));
+      if (!target) {
+        // Throwing here is deliberate. Returning zero instead lets scripts such
+        // as gml_GlobalScript_ImGui spin forever inside a single wasm frame,
+        // where the watchdog cannot reach them; aborting costs one script and
+        // keeps the page responsive.
+        const key = "icall_reg:0x" + (Number(fnptr) >>> 0).toString(16);
+        const n = (this.unknownCallTargets.get(key) ?? 0) + 1;
+        this.unknownCallTargets.set(key, n);
+        throw new Error("icall_reg: unknown fn ptr 0x" + (Number(fnptr) >>> 0).toString(16));
+      }
       return target(rcx, rdx, r8, r9, rsp);
     };
     // _eh_vector_constructor_iterator(ptr, stride, count, ctor): MSVC helper the
@@ -380,6 +401,75 @@ class GMRunner {
         if (r9) { try { impl.icall_reg(r9, elem, 0, 0, 0, rsp); done = true; } catch { /* unresolvable ctor */ } }
         if (!done) { g.dv.setBigUint64(elem, 0n, true); g.dv.setUint32(elem + 8, 0, true); g.dv.setUint32(elem + 12, 0, true); }
       }
+      return [0, 0];
+    };
+    // --- group 1: the ten hottest runner calls -------------------------------
+    // YYError(const char *fmt, ...). Every YYC-generated type/variable check
+    // funnels into this. The real runner aborts the game; here we record the
+    // message once per format string and carry on, which is what the happy
+    // path expects (these calls are never reached when the check passes).
+    impl.f140e632c0 = (rcx) => {
+      const fmt = rcx ? g.readCStr(rcx >>> 0) : "";
+      const n = (self.runnerErrors.get(fmt) ?? 0) + 1;
+      self.runnerErrors.set(fmt, n);
+      if (n <= 3) self.log("runner error: " + (fmt || "0x" + (rcx >>> 0).toString(16)));
+      return [0, 0];
+    };
+    // YYGetInt64(RValue *rcx) -> int64 in rax. See GMRunner.rvToInt64.
+    impl.f140e4a740 = (rcx) => [self.rvToInt64(rcx), 0];
+    // `a.b = v` where the left-hand side is still an RValue: resolve it, then
+    // store. rdx = member cell id, r8 = array index (0x80000000 = none),
+    // r9 = RValue holding the value.
+    impl.f140e87930 = (rcx, rdx, _r8, r9) => {
+      self.setMember(self.memberKeyFor(rcx), rdx | 0, r9);
+      return [1, 0];
+    };
+    // `a.b = v` where the left-hand side is already an instance pointer.
+    impl.f140e86fa0 = (rcx, rdx, _r8, r9) => {
+      self.setMember(rcx >>> 0, rdx | 0, r9);
+      return [1, 0];
+    };
+    // `a.b` read. Same arguments, but r9 is the RValue to write the result into.
+    impl.f140e87170 = (rcx, rdx, _r8, r9) => {
+      self.getMember(self.memberKeyFor(rcx), rdx | 0, r9);
+      return [1, 0];
+    };
+    // RValue destructor with the "free the value" flag cleared. YYC emits this
+    // at the end of every scope for each temporary; with no refcounting in this
+    // shim there is genuinely nothing to do.
+    impl.f140e4cd60 = () => [0, 0];
+    // Constructor prelude: store the owning instance/struct pointer on the new
+    // object. The decrement it performs first is a "am I inside a `new`?" guard
+    // whose only effect is the error path above.
+    impl.f140e643a0 = (rcx, rdx) => {
+      if (rcx) g.dv.setBigUint64(rcx + 0x20, BigInt(rdx), true);
+      return [0, 0];
+    };
+    // Set an object's name pointer and mark it as named (flag 8 at +0x58).
+    impl.f140e64380 = (rcx, rdx) => {
+      if (!rcx) return [0, 0];
+      const flags = Number(g.dv.getBigUint64(rcx + 0x58, true));
+      if (flags & 8) return [0, 0];
+      g.dv.setBigUint64(rcx + 0x28, BigInt(rdx), true);
+      g.dv.setBigUint64(rcx + 0x58, BigInt(flags | 8), true);
+      return [0, 0];
+    };
+    // RValue::operator=(RValue *rcx, int rdx): release the old value if it was
+    // a string/array/object, then store rdx as a real.
+    impl.f140044220 = (rcx, rdx) => {
+      if (!rcx) return [rcx, 0];
+      const k = g.dv.getUint32(rcx + 12, true) & 31;
+      if (1 << k & 70) impl.f140041a50(rcx, 0, 0, 0, 0);
+      g.writeRVDouble(rcx, rdx | 0);
+      return [rcx, 0];
+    };
+    // RValue copy (rcx = dst, rdx = src).
+    impl.f1400424f0 = (rcx, rdx) => {
+      self.copyRV(rcx, rdx);
+      return [rcx, 0];
+    };
+    impl.f1400424a0 = (rcx, rdx) => {
+      self.copyRV(rcx, rdx);
       return [0, 0];
     };
     // _eh_vector_destructor_iterator(ptr, stride, count, dtor): same, in reverse.
@@ -447,7 +537,9 @@ class GMRunner {
   }
   // Callers sometimes hand us an RVA instead of a full VA (see makeImports).
   fnByPtr(ptr) {
-    let va = Number(ptr) >>> 0;
+    let va = Number(ptr);
+    if (!Number.isFinite(va) || va <= 0) return void 0;
+    if (va >= IMAGE_BASE) va -= IMAGE_BASE;
     if (va > 0 && va < IMAGE_BASE) va += IMAGE_BASE;
     return this.fnByVa(va);
   }
@@ -464,17 +556,27 @@ class GMRunner {
       if (!this.nullSlot) this.nullSlot = this.guest.alloc(16, 16);
       return [this.nullSlot, 0];
     }
-    const cellId = this.guest.dv.getInt32(rdx, true);
-    const inst = this.instanceByGuestPtr(selfPtr);
+    const inst = this.instanceByGuestPtr(selfPtr) ?? this.unknownInst(selfPtr);
+    const cellId = rdx > 0 && rdx + 4 <= this.guest.u8.length ? this.guest.dv.getInt32(rdx, true) : -1;
     const name = this.meta.cellNames[cellId] ?? "";
     const slot = this.varSlot(inst, cellId, name);
     return [slot, 0];
   }
+  // An indirect call through a pointer we never created (a struct or an object
+  // the runner would have allocated). Aborting the script, which is what
+  // throwing did, loses everything the script would otherwise have done; a
+  // throwaway object with its own variable slots at least lets it run.
+  unknownInst(ptr) {
+    let o = this.unknownInsts.get(ptr);
+    if (!o) {
+      o = { id: -1, objIndex: -1, guestPtr: ptr, slots: /* @__PURE__ */ new Map(), alive: true };
+      this.unknownInsts.set(ptr, o);
+    }
+    return o;
+  }
   instanceByGuestPtr(p) {
     const id = this.guestPtrMap.get(p);
-    const inst = id !== void 0 ? this.instances.get(id) : void 0;
-    if (!inst) throw new Error("no instance at guest ptr 0x" + p.toString(16));
-    return inst;
+    return id !== void 0 ? this.instances.get(id) : void 0;
   }
   varSlot(inst, cellId, name) {
     let slot = inst.slots.get(cellId);
@@ -614,9 +716,143 @@ class GMRunner {
   syncBuiltinFromSlotAll(inst) {
     for (const [cellId, name] of this.builtinCellCache) this.syncBuiltinFromSlot(inst, cellId, name);
   }
+  // --- member access (`a.b` / `a.b = v`) ------------------------------------
+  // GMS 2.3 compiles the dot operator into three runner calls: one that takes
+  // the left-hand side as an RValue (f140e87930 write / f140e87170 read) and
+  // one that takes an already-resolved instance pointer (f140e86fa0). The
+  // member is identified by a *cell id*, an index into `meta.cellNames`, and
+  // the optional array index is 0x80000000 when the access is not indexed.
+  //
+  // The instance/struct itself is identified by its guest pointer. Instances
+  // the shim created have real bookkeeping (`varSlot` + syncBuiltinTo/From);
+  // everything else (structs, which the runner allocates with an ABI call we
+  // have not implemented yet) falls back to a plain pointer -> cell -> slot
+  // table so reads and writes at least round-trip.
+  cellName(cellId) {
+    return this.meta?.cellNames?.[cellId] ?? "";
+  }
+  tryInstance(ptr) {
+    if (!ptr) return void 0;
+    const id = this.guestPtrMap.get(ptr);
+    return id !== void 0 ? this.instances.get(id) : void 0;
+  }
+  memberSlot(key, cellId, create) {
+    if (!key) return 0;
+    let m = this.members.get(key);
+    if (!m) {
+      if (!create) return 0;
+      m = /* @__PURE__ */ new Map();
+      this.members.set(key, m);
+    }
+    let s = m.get(cellId);
+    if (s === void 0) {
+      if (!create) return 0;
+      s = this.guest.alloc(16, 16);
+      this.guest.dv.setBigUint64(s, 0n, true);
+      this.guest.dv.setUint32(s + 8, 0, true);
+      this.guest.dv.setUint32(s + 12, T_UNDEF, true);
+      m.set(cellId, s);
+    }
+    return s;
+  }
+  // 16-byte RValue copy. Real RValue assignment bumps refcounts for strings,
+  // arrays and objects; this shim has no refcounting, so a flat copy is it.
+  copyRV(dst, src) {
+    if (!dst || !src || src + 16 > this.guest.u8.length || dst + 16 > this.guest.u8.length) return;
+    this.guest.u8.copyWithin(dst, src, src + 16);
+  }
+  // Left-hand side of a dot access -> guest pointer used as the member key.
+  // `self` (-1) and `other` (-2) resolve to the pointers the current script
+  // was entered with; anything else is the raw pointer / instance id.
+  resolveTargetKey(rvPtr) {
+    if (!rvPtr) return 0;
+    const g = this.guest;
+    if (rvPtr + 16 > g.u8.length) return 0;
+    const t = g.dv.getUint32(rvPtr + 12, true) & 16777215;
+    if (t === T_OBJECT) return Number(g.dv.getBigUint64(rvPtr, true)) >>> 0;
+    if (t === T_INT32) return g.dv.getInt32(rvPtr, true) | 0;
+    if (t === T_DOUBLE || t === T_BOOL) return Math.trunc(g.dv.getFloat64(rvPtr, true)) | 0;
+    return 0;
+  }
+  memberKeyFor(rvPtr) {
+    const key = this.resolveTargetKey(rvPtr);
+    if (key === -1) return this.curSelfPtr || key;
+    if (key === -2) return this.curOtherPtr || key;
+    return key;
+  }
+  setMember(key, cellId, valueRv) {
+    if (!key || !valueRv) return;
+    const name = this.cellName(cellId);
+    const inst = this.tryInstance(key);
+    if (inst) {
+      const slot = this.varSlot(inst, cellId, name);
+      this.copyRV(slot, valueRv);
+      this.syncBuiltinFromSlot(inst, cellId, name);
+      return;
+    }
+    const slot = this.memberSlot(key, cellId, true);
+    this.copyRV(slot, valueRv);
+  }
+  getMember(key, cellId, outRv) {
+    if (!outRv) return;
+    if (!key) {
+      this.guest.writeRVUndef(outRv);
+      return;
+    }
+    const name = this.cellName(cellId);
+    const inst = this.tryInstance(key);
+    if (inst) {
+      const slot = this.varSlot(inst, cellId, name);
+      this.copyRV(outRv, slot);
+      return;
+    }
+    const slot = this.memberSlot(key, cellId, true);
+    this.copyRV(outRv, slot);
+  }
+  // RValue -> int64. This is the runner's `YYGetInt64`: reals and bools are
+  // truncated, strings are parsed, pointers/ints are taken as-is, objects give
+  // their instance id, and everything else raises a runner error (here: 0).
+  rvToInt64(rvPtr) {
+    if (!rvPtr || rvPtr + 16 > this.guest.u8.length) return 0;
+    const g = this.guest;
+    const t = g.dv.getUint32(rvPtr + 12, true) & 16777215;
+    switch (t) {
+      case T_DOUBLE:
+      case T_BOOL: {
+        const d = g.dv.getFloat64(rvPtr, true);
+        return Number.isFinite(d) ? Math.trunc(d) : 0;
+      }
+      case T_STRING: {
+        const s = g.readString(Number(g.dv.getBigUint64(rvPtr, true)) >>> 0);
+        const n = Number.parseInt(s.trim(), 10);
+        return Number.isFinite(n) ? n : 0;
+      }
+      case T_OBJECT: {
+        const obj = Number(g.dv.getBigUint64(rvPtr, true)) >>> 0;
+        return obj;
+      }
+      default:
+        return Number(g.dv.getBigInt64(rvPtr, true));
+    }
+  }
   dispatchFunction(selfPtr, otherPtr, resultPtr, argc, id, argsPtr) {
     try {
       this.checkBudget("dispatch");
+      const outerSelf = this.curSelfPtr, outerOther = this.curOtherPtr;
+      if (selfPtr) this.curSelfPtr = selfPtr;
+      if (otherPtr) this.curOtherPtr = otherPtr;
+      try {
+        this.dispatchInner(selfPtr, otherPtr, resultPtr, argc, id, argsPtr);
+      } finally {
+        this.curSelfPtr = outerSelf;
+        this.curOtherPtr = outerOther;
+      }
+    } catch (e) {
+      this.log("dispatch " + (this.meta.cellNames[id] ?? id) + " threw: " + String(e).slice(0, 120));
+    }
+  }
+  dispatchInner(selfPtr, otherPtr, resultPtr, argc, id, argsPtr) {
+    {
       const name = this.meta.cellNames[id];
       if (name === void 0) {
         this.log("dispatch: bad id " + id);
@@ -636,12 +872,6 @@ class GMRunner {
       const exportName = "g_" + f.n.replace(/[^A-Za-z0-9_@]/g, "_");
       const fn = this.exports[exportName];
       fn(BigInt(selfPtr), BigInt(otherPtr), BigInt(resultPtr), 0n, 0n);
-    } catch (e) {
-      this.log("dispatch " + (this.meta.cellNames[id] ?? id) + " threw: " + String(e).slice(0, 120));
-      try {
-        this.guest.writeRVUndef(resultPtr);
-      } catch {
-      }
     }
   }
   callBuiltin(name, selfPtr, _otherPtr, resultPtr, argc, argsPtr) {
