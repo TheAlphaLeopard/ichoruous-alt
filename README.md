@@ -76,18 +76,21 @@ This is a work in progress and the rewrite did not change where it stands: the
 game boots, loads every artifact, enters its first room and then **stalls in
 `rmInit`** — six manager objects step forever and nothing is drawn.
 
-The shim is missing pieces of the GameMaker runner, not of the web port:
+The shim reimplements the GameMaker runner's ABI by hand, and it is nowhere near
+finished: 26 of the 281 runner functions the exe calls are implemented, the rest
+return 0. The named GML builtins (a couple of hundred of them) do work, which is
+why the game boots and steps at all.
 
-- ~15 runner ABI functions are unimplemented (the busiest are at `0x14128ab40`,
-  `0x14128aa70`, `0x14040fdc0`, `0x140e64380`) — they are not lifted GML, they are
-  internals of the original runner that still need to be reverse-engineered.
-- GMS 2.3 **method dispatch** is unsupported, so calls like `__state()`,
-  `target()`, `uiClick()` log "unknown function" and return undefined.
-- 42 of the 499 boot scripts throw when executed with an unbound `self` (caught
-  and logged; they are mostly script registration).
+There is no shortcut available. `data.win` contains no `CODE` chunk, so there is
+no GML bytecode to run on the stock HTML5 runner the way other GameMaker web
+ports do — the only executable form of this game's logic is the x64 machine code
+that `tools/gex/` lifts. See [docs/architecture.md](docs/architecture.md) for the
+full comparison and the list of what is missing.
 
-None of these hang or crash any more — they are correctness gaps. Say the word and
-I will start on the ABI functions.
+Two real bugs were found and fixed while studying it (function pointers passed as
+RVAs, and the MSVC array constructor/destructor iterators); boot script failures
+went from 42 to 35. The remaining work is per-function reverse engineering,
+aided by `tools/probe-abi.mjs` and `tools/disas.mjs`.
 
 ## Tools
 

@@ -2,6 +2,7 @@
   "name": "ichoruous-web",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Ichorous (GameMaker, x64) statically recompiled to WebAssembly, running in the browser as a plain static site — no framework, no build step, no dependencies.",
   "scripts": {
     "start": "node tools/serve-static.mjs . --port 8080",
@@ -9,6 +10,8 @@
     "smoke": "node --max-old-space-size=2048 tools/smoke.mjs 300",
     "verify:loader": "node tools/verify_loader.mjs",
     "verify": "npm run smoke && npm run verify:loader",
+    "disas": "node tools/disas.mjs",
+    "probe:abi": "node --max-old-space-size=2048 tools/probe-abi.mjs",
 
     "gex:harness": "node tools/gex/harness.js",
     "gex:mine": "node tools/gex/mine.js",
