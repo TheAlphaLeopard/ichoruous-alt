@@ -347,13 +347,50 @@ class GMRunner {
       void r9;
       return self.vtableCall(selfP, disp, rcx, rdx);
     };
-    impl.icall_reg = (fnptr, rcx, rdx, r8, r9) => {
-      const f = self.fnByVa(fnptr);
-      if (!f) throw new Error("icall_reg: unknown fn ptr 0x" + fnptr.toString(16));
-      const exportName = "g_" + f.n.replace(/[^A-Za-z0-9_@]/g, "_");
-      const fn = self.exports[exportName];
-      const res = fn(rcx, rdx, r8, r9, 0);
-      return [Number(res[0]), Number(res[1])];
+    // Resolve an indirect call target. The guest stores some function pointers
+    // as RVAs (32-bit offsets from the image base) rather than full VAs, so a
+    // small value has to be rebased before it can be looked up.
+    const resolve = (fnptr) => {
+      let va = Number(fnptr) >>> 0;
+      if (va > 0 && va < IMAGE_BASE) va += IMAGE_BASE;
+      const f = self.fnByVa(va);
+      if (f) {
+        const fn = self.exports["g_" + f.n.replace(/[^A-Za-z0-9_@]/g, "_")];
+        if (fn) return (a, b, c, d) => { const r = fn(a, b, c, d, 0); return [Number(r[0]), Number(r[1])]; };
+      }
+      // the target may be a runner function this shim implements
+      const sub = impl["f" + va.toString(16)];
+      if (sub) return (a, b, c, d, rsp) => { const r = sub(a, b, c, d, rsp); return [Number(r[0]), Number(r[1])]; };
+      return null;
+    };
+    impl.icall_reg = (fnptr, rcx, rdx, r8, r9, rsp) => {
+      const target = resolve(fnptr);
+      if (!target) throw new Error("icall_reg: unknown fn ptr 0x" + (Number(fnptr) >>> 0).toString(16));
+      return target(rcx, rdx, r8, r9, rsp);
+    };
+    // _eh_vector_constructor_iterator(ptr, stride, count, ctor): MSVC helper the
+    // compiler emits for arrays of RValues. Without it every element of a GML
+    // array literal is left as whatever was on the stack.
+    impl.f14128ab40 = (rcx, rdx, r8, r9, rsp) => {
+      const count = r8 | 0;
+      if (!(count > 0) || count > 1e6) return [0, 0];
+      for (let i = 0; i < count; i++) {
+        const elem = rcx + i * rdx;
+        let done = false;
+        if (r9) { try { impl.icall_reg(r9, elem, 0, 0, 0, rsp); done = true; } catch { /* unresolvable ctor */ } }
+        if (!done) { g.dv.setBigUint64(elem, 0n, true); g.dv.setUint32(elem + 8, 0, true); g.dv.setUint32(elem + 12, 0, true); }
+      }
+      return [0, 0];
+    };
+    // _eh_vector_destructor_iterator(ptr, stride, count, dtor): same, in reverse.
+    impl.f14128aa70 = (rcx, rdx, r8, r9, rsp) => {
+      const count = r8 | 0;
+      if (!(count > 0) || count > 1e6) return [0, 0];
+      for (let i = count - 1; i >= 0; i--) {
+        if (!r9) continue;
+        try { impl.icall_reg(r9, rcx + i * rdx, 0, 0, 0, rsp); } catch { /* unresolvable dtor */ }
+      }
+      return [0, 0];
     };
     const wrapped = {};
     for (const [k, fn] of Object.entries(impl)) {
@@ -374,10 +411,32 @@ class GMRunner {
     return new Proxy(wrapped, {
       get(target, prop) {
         if (prop in target) return target[prop];
-        return (a, b, c) => {
+        return (a, b, c, d, e) => {
           const key = "abi:" + prop;
-          self.unimplementedBuiltins.set(key, (self.unimplementedBuiltins.get(key) ?? 0) + 1);
-          if ((self.unimplementedBuiltins.get(key) ?? 0) <= 3) self.log("unimplemented ABI " + prop + " rcx=" + Number(a) + " rdx=" + Number(b) + " r8=" + Number(c));
+          const n = (self.unimplementedBuiltins.get(key) ?? 0) + 1;
+          self.unimplementedBuiltins.set(key, n);
+          // opt-in probe (see tools/probe-abi.mjs): records raw arguments for the
+          // first few calls so an unimplemented runner function can be identified
+          if (self.abiProbe) {
+            let rec = self.abiProbe.get(prop);
+            if (!rec) self.abiProbe.set(prop, rec = []);
+            if (rec.length < 4) {
+              const stack = [];
+              for (let i = 4; i <= 8; i++) {
+                try { stack.push(Number(g.dv.getBigUint64(Number(e) + 40 + 8 * (i - 4), true))); }
+                catch { stack.push(-1); }
+              }
+              rec.push({ rcx: Number(a), rdx: Number(b), r8: Number(c), r9: Number(d), rsp: Number(e), stack });
+            }
+          }
+          if (n <= 2) {
+            // Record who called it: V8 keeps wasm frames in Error.stack, which is
+            // the fastest way to work out what an unimplemented import should do.
+            let stack = "";
+            try { throw new Error("trace"); } catch (e) { stack = String(e.stack); }
+            const frames = stack.split("\n").slice(1, 7).map((s) => s.trim().replace(/^at /, "")).join(" | ");
+            self.log("unimplemented ABI " + prop + " rcx=" + Number(a) + " rdx=" + Number(b) + " r8=" + Number(c) + " <- " + frames);
+          }
           return [0n, 0];
         };
       }
@@ -385,6 +444,12 @@ class GMRunner {
   }
   fnByVa(va) {
     return this.meta.fns.find((f) => f.va === va);
+  }
+  // Callers sometimes hand us an RVA instead of a full VA (see makeImports).
+  fnByPtr(ptr) {
+    let va = Number(ptr) >>> 0;
+    if (va > 0 && va < IMAGE_BASE) va += IMAGE_BASE;
+    return this.fnByVa(va);
   }
   rvToNum(r) {
     if (r.t === T_STRING) return parseFloat(this.guest.readString(r.v)) || 0;
