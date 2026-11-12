@@ -11,6 +11,10 @@
     "verify:loader": "node tools/verify_loader.mjs",
     "verify": "npm run smoke && npm run verify:loader",
     "disas": "node tools/disas.mjs",
+    "jumptable": "node tools/jumptable.mjs",
+    "xrefs": "node --max-old-space-size=2048 tools/xrefs.mjs",
+    "builtins": "node tools/builtin-scan.mjs",
+    "boot:report": "node --max-old-space-size=2048 tools/boot-report.mjs",
     "probe:abi": "node --max-old-space-size=2048 tools/probe-abi.mjs",
 
     "gex:harness": "node tools/gex/harness.js",
