@@ -85,7 +85,28 @@ Instance layout offsets that show up repeatedly:
 | `0x14128ab40` | — | MSVC `_eh_vector_constructor_iterator` |
 | `0x14128aa70` | — | MSVC `_eh_vector_destructor_iterator` |
 
-Not yet characterised, next in line by call count: `0x14128a900` /
+### Call shapes that bite
+
+`0x140e87440` and `0x140e634e0` are worth singling out because both had shims
+that read arguments the functions do not have.
+
+`0x140e87440(instance, memberCell, arrayIndexOr0x80000000, RValue *out)` is the
+member read for an *already resolved* instance pointer — the sibling of
+`0x140e87170`. It takes **no stack arguments**. Reading two anyway produced the
+`dispatch: bad id` flood that dominated the guest log for a long time.
+
+`0x140e634e0(self, other, RValue *result, argc, callee, args)` is the generic
+call. Its `callee` slot has three shapes and has to be resolved before use
+(`callTargetId`):
+
+* a plain **cell id** — calling a built-in or a named script;
+* a pointer to an **RValue** — a GMS 2.3 method held in a variable. When that
+  RValue is `undefined`, which is every struct method until the struct ABI
+  exists, there is nothing to call; guessing an id from the bits used to
+  dispatch nonsense;
+* occasionally a raw **code address**.
+
+### Not yet characterised, next in line by call count: `0x14128a900` /
 `0x14128a960` (a paired id allocate/release, both 1052), `0x140e63aa0` (996,
 instance lookup by id — it tests `rcx >= 0x186a0`, the 100000 instance-id
 base), `0x1400462a0` (897), `0x140069500` (808), `0x140041df0` (704).
