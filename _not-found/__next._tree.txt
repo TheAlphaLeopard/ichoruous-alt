@@ -1,4 +1,0 @@
-:HL["/ichoruous-alt/_next/static/chunks/2_straa9_-tef.css","style"]
-2:[["children",{"s":"__PAGE__","h":160}]]
-1:[["children",{"s":"/_not-found","h":96,"c":"$Q2"}]]
-0:{"b":"T2ffFzKJndt0FE4iw06oY","t":{"t":{"s":"","h":80,"c":"$Q1"}}}
