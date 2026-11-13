@@ -86,7 +86,7 @@ Instance layout offsets that show up repeatedly:
 | `0x14128aa70` | — | MSVC `_eh_vector_destructor_iterator` |
 | `0x140e851f0` | — | **three-way comparison.** `(RValue *left, RValue *right) -> -1 / 0 / 1` in `rax`. It switches on `kindA*16 + kindB` (capped at `0xf0`, i.e. 15×15) through a compressed jump table; the plain integer case is `cvttsd2si rax,[left] / sub rax,[right] / sar 31 / and -2 / +1`. `-2` means "not comparable". See below: getting this wrong hangs the interpreter. |
 | `0x140042560` | — | **in-place RValue multiply.** `(RValue *dst, RValue *src) -> dst` with `dst = dst * src`; the double case is literally `movsd xmm0,[src] / mulsd xmm0,[dst] / movsd [dst],xmm0`. Only two arguments. |
-| `0x140e645a0` | 255822 | **GMS 2.3 method creation.** `(RValue *out, fn, struct)` sets `out->kind = 6` (object) and points it at a freshly allocated `0xe0`-byte method object tagged `"METH"` (`0x4d455448`), which stores the function at `+0x90`, the bound struct at `+0xa8` (only when non-zero), and the resolved script at `+0xb8`. This is the missing half of the `dispatch: uncallable callee` flood: every anonymous function in the game becomes a method value through here, and none of them can be called until the result is something `callTargetId` recognises. |
+| `0x140e645a0` | 255822 | **GMS 2.3 method creation.** `(RValue *out, script, struct)` sets `out->kind = 6` (object) and points it at a freshly allocated `0xe0`-byte method object tagged `"METH"` (`0x4d455448`), which stores the script at `+0x90`, the bound struct at `+0xa8` (only when non-zero) and the resolved script record at `+0xb8`. Two gotchas: the script arrives as an **RVA** (`0xd21190`, not `0x140d21190`), so it has to go through `fnByPtr`; and the struct argument is 0 for an unbound function value, which is the common case. See below. |
 
 ### Call shapes that bite
 
@@ -213,30 +213,57 @@ GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --filter=blob:none --no-checkout \
   make — it has no loop and calls nothing of the kind. Trust the chain for
   narrow questions, verify with a call count before acting on it.
 
+## Two ways to lose the whole run
+
+Both of these are about a guest loop that never terminates. There is no
+`Error.stack` to read, the watchdog cannot see inside a wasm frame, and the
+failure looks like an out-of-memory rather than a bug.
+
+**The watchdog was wired up but could never fire.** `checkBudget` only arms
+itself at `callDepth 0`, and only `callGuest` moved that counter — so a script
+reached through a call from another script ran with the watchdog permanently
+disarmed. And `dispatchFunction` caught every exception, *including the
+watchdog's own timeout*, so even when it did fire the throw was swallowed and
+the loop carried on. Both now fixed: the budget is checked on every ABI import,
+`enterGuest` does the same bookkeeping `callGuest` does, a timeout is rethrown
+rather than logged, and a handler that overruns three times is disabled for
+good. A room's creation code gets its own budget, because it never reaches the
+frame loop and no amount of frame-loop machinery helps it.
+
+**A loop that never calls the host cannot be stopped at all.** A single frame
+of `rmSqualorLevelBoss` runs 2046500 member reads, 767447 GML calls and 255822
+method creations. When one of those loops instead touches nothing but its own
+registers, there is no host boundary to intercept: the process grows until
+something kills it. The only defences are structural — terminate the worker
+(`js/main.js`) or isolate the room in its own process
+(`room-walk.mjs --isolate`).
+
+`enterGuest` also bounds call depth, because runaway recursion burns the JS
+stack and V8 reports that as an unrecoverable out-of-memory rather than a
+catchable stack overflow.
+
 ## Where the frame loop stands
 
-With the event table, the vtable, the comparison and the multiply all fixed:
+Methods are the most recent piece: `0x140e645a0` is implemented, and an
+unbound method costs no storage at all because the script's own code address
+is already an unambiguous payload — no real guest pointer is anywhere near the
+image base. That matters more than it sounds, because the old shim handed out
+a 32-byte allocation per method and the game makes a quarter of a million of
+them in a single frame. Rooms that drew 0.1 sprites per frame now draw 5–8.
 
-* boot: **498 scripts ok, 0 threw** (was 490 / 8);
-* `tools/room-walk.mjs 10`: 24 of 75 rooms entered, 15 of them drawing
-  something, mean 1.2 draws/frame, 0 frame throws, 5.8s;
-* working set 607 of 5555 lifted functions (10.9%), RSS 491MB;
-* unimplemented ABI imports: 6419 calls across 149 distinct — most of the top
-  of the list is the `0x140041xxx`–`0x140046xxx` refcount and RValue family.
+See `docs/port-status.md` for the current measurements. As of this writing:
+498 boot scripts with none throwing, 72 of 75 rooms survivable, 61 of them
+drawing, 5.4 draw calls per frame on average.
 
-Two things now stand in the way, and they are separate problems:
+**The three tutorial rooms run away**, all in the same `oMeatBlob`
+constructor. It builds a struct, binds a method to it, and repeats; every
+struct is a fresh allocation, so nothing can be reused. It fails identically
+with method dispatch switched off.
 
-**Guest heap exhaustion** stops the walk at room 24 of 75. The heap is a bump
-allocator with an 8MB budget (32505856 → 40894464) and nothing is ever freed,
-because `0x140041a50` and friends are no-ops. One frame of
-`rmSqualorLevelBoss` alone asks for 8MB: 514 instances, 2046500 member reads,
-767447 GML calls, and 255822 method creations, at ~5.4s for the frame. The
-*real* runner survives that because it refcounts; ours cannot.
-
-**`dispatch: uncallable callee`**, 1605 of them over the same walk, is the
-method gap above. The callee slot is an RValue holding either 0.0 (1120) or
-`undefined` (175), and the callers are anonymous struct methods — Scribble's
-`element.get_bbox` accounts for 780 of them on its own.
+**Nothing is ever freed**, which is the root cause and is the next piece of
+real work. The heap is a bump allocator with an 8MB budget (32505856 →
+40894464) and the decref shims are no-ops, so every `@@NewGMLObject@@` and
+every bound method lives forever. The real runner survives on refcounting.
 
 ## The alternative to hand-shimming
 
