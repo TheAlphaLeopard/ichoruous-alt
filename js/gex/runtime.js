@@ -1,5 +1,8 @@
 const IMAGE_BASE = 5368709120;
+// RValue kinds, from the runner's kind table at 0x140e4abe8. GameMaker stores
+// an operand's kind in the low 24 bits of the fourth word of the RValue.
 const T_DOUBLE = 0, T_STRING = 1, T_ARRAY = 2, T_PTR = 3, T_BOOL = 4, T_UNDEF = 5, T_OBJECT = 6, T_INT32 = 7;
+const T_VEC3 = 8, T_VEC4 = 9, T_INT64 = 10, T_ACCESSOR = 11, T_NULL = 12, T_INT_BOOL = 13;
 class Guest {
   constructor() {
     this.heapPtr = 32505856;
@@ -119,6 +122,8 @@ class GMRunner {
     this.globalVarIds = /* @__PURE__ */ new Map();
     this.nameToCell = /* @__PURE__ */ new Map();
     this.running = true;
+    this.methods = /* @__PURE__ */ new Map();
+    this.methodSeq = 0;
     this.abiTrace = [];
     this.scopeStack = [];
     this.traceABI = false;
@@ -204,6 +209,21 @@ class GMRunner {
     }
     return { rax: Number(res[0]), xmm0: Number(res[1]) };
   }
+  // Enter a lifted function with the same bookkeeping callGuest does. The
+  // budget watchdog only arms itself at callDepth 0, and only callGuest used
+  // to move that counter - so a script reached through a call from another
+  // script ran with the watchdog permanently disarmed, and a handler that
+  // spun took the whole tab with it instead of being timed out and disabled.
+  enterGuest(fn, a, b, c, d, e) {
+    const top = this.callDepth === 0;
+    if (top && this.budgetMs) this.budgetStart = this.now();
+    this.callDepth++;
+    try {
+      return fn(a, b, c, d, e);
+    } finally {
+      this.callDepth--;
+    }
+  }
   makeImports() {
     const g = this.guest;
     const self = this;
@@ -280,40 +300,84 @@ class GMRunner {
       else d = g.dv.getFloat64(rcx, true);
       return [0, d];
     };
-    impl.f140e851f0 = (rcx, rdx, _r8, r9) => {
+    // Three-way comparison: rcx is the left operand, rdx the right, and the
+    // result is -1, 0 or 1 in rax - not a boolean. Lifted `for` and `while`
+    // loops test `rax < 0` afterwards (the sign of a subtraction), so a shim
+    // that returned a boolean made them run either zero times or forever.
+    impl.f140e851f0 = (rcx, rdx) => {
       try {
-        const opSel = r9 | 0;
-        const a = g.readRV(rdx);
-        if (a.t === T_STRING) {
-          g.u8.copyWithin(rcx, rdx, rdx + 16);
-          return [0, 0];
+        const a = g.readRV(rcx), b = g.readRV(rdx);
+        if (a.t === T_STRING && b.t === T_STRING) {
+          const x = g.readString(a.v), y = g.readString(b.v);
+          return [x < y ? -1 : x > y ? 1 : 0, 0];
         }
-        const av = self.rvToNum(a);
-        if (opSel === 0) g.u8.copyWithin(rcx, rdx, rdx + 16);
-        else g.writeRVDouble(rcx, -av);
+        const x = self.rvToNum(a), y = self.rvToNum(b);
+        return [x < y ? -1 : x > y ? 1 : 0, 0];
       } catch (e) {
-        self.log("unaryop: " + String(e).slice(0, 80));
+        self.log("compare: " + String(e).slice(0, 80));
       }
       return [0, 0];
+    };
+    // RValue multiply in place: (dst, src) -> dst = dst * src, returning dst.
+    // The real function switches on the kind of its first argument and has no
+    // third argument at all; reading one as a count made it loop 50 million
+    // times over a destructuring thunk it had invented, which hung the whole
+    // interpreter inside a single wasm frame where nothing could interrupt it.
+    impl.f140042560 = (rcx, rdx) => {
+      const a = self.rvToNum(g.readRV(rcx)), b = self.rvToNum(g.readRV(rdx));
+      const v = a * b;
+      const t = rvType(rcx);
+      if (t === T_INT32) g.dv.setInt32(rcx, Math.trunc(v) | 0, true);
+      else if (t === T_INT64) g.dv.setBigUint64(rcx, BigInt(Math.trunc(v)), true);
+      else g.writeRVDouble(rcx, v);
+      return [rcx, 0];
     };
     // Call a GML function: (self, other, RValue *result, argc, callee, args).
     // The callee slot has three shapes - a plain cell id for a built-in, a
     // pointer to an RValue holding a GMS 2.3 method, and occasionally a raw
     // code address - so it has to be resolved before it is dispatched.
     impl.f140e634e0 = (rcx, rdx, r8, r9, rsp) => {
-      self.dispatchFunction(rcx, rdx, r8, r9, self.callTargetId(stackArg(rsp, 4)), stackArg(rsp, 5));
+      self.dispatchFunction(rcx, rdx, r8, r9, stackArg(rsp, 4), stackArg(rsp, 5));
       return [0, 0];
     };
     impl.f140e63610 = (rcx, rdx, r8, r9, rsp) => {
-      self.dispatchFunction(rcx, rdx, r8, r9, self.callTargetId(stackArg(rsp, 4)), stackArg(rsp, 5));
+      self.dispatchFunction(rcx, rdx, r8, r9, stackArg(rsp, 4), stackArg(rsp, 5));
       return [0, 0];
     };
+    // GMS 2.3 method creation: (RValue *out, code address of the script,
+    // struct to bind or 0). The real runner allocates a 0xe0-byte object
+    // tagged "METH" here and stores the script at +0x90 and the struct at
+    // +0xa8. This keeps the record on the JS side instead: the game builds
+    // a quarter of a million of these in a single frame, and nothing in this
+    // shim frees memory, so handing out a real allocation each time is what
+    // exhausted the 8MB guest heap.
     impl.f140e645a0 = (rcx, rdx, r8) => {
-      const p = g.alloc(32, 8);
-      g.dv.setBigUint64(p, BigInt(rdx), true);
-      g.dv.setBigUint64(p + 8, BigInt(r8), true);
-      g.dv.setUint32(p + 16, 1296389192, true);
-      g.writeRV(rcx, { v: p, flags: 8, t: T_OBJECT });
+      // rdx is the script's code address and arrives as an RVA (0xd21190,
+      // not 0x140d21190), so it has to go through fnByPtr rather than being
+      // compared against the image base directly.
+      const f = self.fnByPtr(rdx);
+      const va = f ? f.va : Number(rdx);
+      if (!(r8 | 0) && va >= IMAGE_BASE) {
+        // Unbound: the script's own code address is the payload. Real guest
+        // pointers all live in the 48MB image, so anything at or above the
+        // image base can only be one of these, and the method costs no
+        // memory at all worth speaking of.
+        g.writeRV(rcx, { v: va, flags: 8, t: T_OBJECT });
+        return [0, 0];
+      }
+      const id = ++self.methodSeq;
+      self.methods.set(id, { fn: f ? f.n : null, va, self: r8 | 0 });
+      // Bound methods need a record, so the map has to stay bounded. Ids are
+      // sequential and the map iterates in insertion order, so the oldest
+      // half can be dropped by id.
+      if (self.methods.size > 1048576) {
+        const cutoff = id - 524288;
+        for (const k of self.methods.keys()) {
+          if (k >= cutoff) break;
+          self.methods.delete(k);
+        }
+      }
+      g.writeRV(rcx, { v: id, flags: 8, t: T_OBJECT });
       return [0, 0];
     };
     // `a.b` read where the left-hand side is already an instance pointer: the
@@ -356,9 +420,14 @@ class GMRunner {
     };
     impl.icall = (vtbl, selfP, disp, rcx, rdx, r8, r9) => {
       void vtbl;
+      void selfP;
       void r8;
       void r9;
-      return self.vtableCall(selfP, disp, rcx, rdx);
+      // rcx is `this` - a Windows x64 member call always passes the object in
+      // rcx. selfP, the base register of the call's memory operand, is the
+      // vtable pointer, and using it as the instance sent every object through
+      // unknownInst() and so into one shared set of variable slots.
+      return self.vtableCall(rcx, disp, rcx, rdx);
     };
     // Resolve an indirect call target. The guest stores some function pointers
     // as RVAs (offsets from the image base) rather than full VAs, so a bare
@@ -540,7 +609,14 @@ class GMRunner {
     });
   }
   fnByVa(va) {
-    return this.meta.fns.find((f) => f.va === va);
+    // Built lazily on first use. A linear scan is fine for the handful of
+    // resolutions makeImports does, but method creation calls this once per
+    // method and the game makes hundreds of thousands in one frame.
+    if (!this._fnByVa) {
+      this._fnByVa = /* @__PURE__ */ new Map();
+      for (const f of this.meta.fns) this._fnByVa.set(f.va, f);
+    }
+    return this._fnByVa.get(va);
   }
   // Callers sometimes hand us an RVA instead of a full VA (see makeImports).
   fnByPtr(ptr) {
@@ -846,7 +922,7 @@ class GMRunner {
   // object RValue (a pointer) or as the numeric handle the shim handed out.
   structKey(rvPtr) {
     const r = this.guest.readRV(rvPtr);
-    if (r.t === T_OBJECT && r.v) {
+    if (r.t === T_OBJECT && r.v && r.v < IMAGE_BASE && !this.methods.has(r.v)) {
       let id = this.structIds.get(r.v);
       if (id === void 0) {
         id = this.dsNewMap();
@@ -876,14 +952,42 @@ class GMRunner {
     }
     return -1;
   }
-  dispatchFunction(selfPtr, otherPtr, resultPtr, argc, id, argsPtr) {
+  dispatchFunction(selfPtr, otherPtr, resultPtr, argc, callee, argsPtr) {
     try {
       this.checkBudget("dispatch");
-      if (id < 0) {
+      const target = this.resolveCallee(callee);
+      if (!target) {
         this.log("dispatch: uncallable callee");
         this.guest.writeRVUndef(resultPtr);
         return;
       }
+      if (target.method) {
+        const rec = target.method;
+        if (!rec.fn) {
+          this.log("dispatch: method with no script (va 0x" + rec.va.toString(16) + ")");
+          this.guest.writeRVUndef(resultPtr);
+          return;
+        }
+        const fn = this.exports["g_" + rec.fn.replace(/[^A-Za-z0-9_@]/g, "_")];
+        if (!fn) {
+          this.log("dispatch: method script not lifted " + rec.fn);
+          this.guest.writeRVUndef(resultPtr);
+          return;
+        }
+        // A method carries its own `self`: the struct it was bound to, or,
+        // for an unbound function value, whatever the caller was running as.
+        const outerSelf = this.curSelfPtr, outerOther = this.curOtherPtr;
+        const bound = rec.self || selfPtr;
+        try {
+          if (bound) this.curSelfPtr = bound;
+          this.enterGuest(fn, BigInt(bound), BigInt(otherPtr), BigInt(resultPtr), 0n, 0n);
+        } finally {
+          this.curSelfPtr = outerSelf;
+          this.curOtherPtr = outerOther;
+        }
+        return;
+      }
+      const id = target.cell;
       const outerSelf = this.curSelfPtr, outerOther = this.curOtherPtr;
       if (selfPtr) this.curSelfPtr = selfPtr;
       if (otherPtr) this.curOtherPtr = otherPtr;
@@ -894,8 +998,31 @@ class GMRunner {
         this.curOtherPtr = outerOther;
       }
     } catch (e) {
-      this.log("dispatch " + (this.meta.cellNames[id] ?? id) + " threw: " + String(e).slice(0, 120));
+      // A timeout has to keep going. Swallowing it here meant a handler that
+      // spun was never timed out, never disabled, and never stopped: the
+      // cooperative abort exists precisely to unwind out of these frames.
+      if (String(e && e.message).includes("guest timeout")) throw e;
+      this.log("dispatch threw: " + String(e).slice(0, 120));
     }
+  }
+  // What a call site named: either a cell id, or a GMS 2.3 method value.
+  resolveCallee(v) {
+    const id = this.callTargetId(v);
+    if (id >= 0) return { cell: id };
+    const rec = this.resolveMethod(v);
+    if (rec) return { method: rec };
+    return null;
+  }
+  resolveMethod(rvPtr) {
+    const p = rvPtr >>> 0;
+    if (!p || p + 16 > this.guest.u8.length) return null;
+    if ((this.guest.dv.getUint32(p + 12, true) & 16777215) !== T_OBJECT) return null;
+    const v = Number(this.guest.dv.getBigUint64(p, true));
+    if (v >= IMAGE_BASE) {
+      const f = this.fnByVa(v);
+      return f ? { fn: f.n, va: v, self: 0 } : null;
+    }
+    return this.methods.get(v) ?? null;
   }
   dispatchInner(selfPtr, otherPtr, resultPtr, argc, id, argsPtr) {
     {
@@ -917,7 +1044,12 @@ class GMRunner {
       }
       const exportName = "g_" + f.n.replace(/[^A-Za-z0-9_@]/g, "_");
       const fn = this.exports[exportName];
-      fn(BigInt(selfPtr), BigInt(otherPtr), BigInt(resultPtr), 0n, 0n);
+      if (!fn) {
+        this.log("dispatch: no export for " + f.n);
+        this.guest.writeRVUndef(resultPtr);
+        return;
+      }
+      this.enterGuest(fn, BigInt(selfPtr), BigInt(otherPtr), BigInt(resultPtr), 0n, 0n);
     }
   }
   callBuiltin(name, selfPtr, _otherPtr, resultPtr, argc, argsPtr) {
@@ -1918,10 +2050,21 @@ class GMRunner {
     for (const i of this.instanceList) if (i.alive && this.matchesObject(i, t)) return true;
     return false;
   }
+  // Lifted object code reads [instance] as a vtable pointer and calls through
+  // it, so it has to be a real address inside the guest memory: the constant
+  // this replaced, 485259792, is nearly ten times past the end of it, and the
+  // load of the call target trapped on the first virtual call of every object
+  // event. The last page of memory is free - the stack grows down from 46MB
+  // and the heap grows up from about 31MB - and the slots are never read,
+  // because abi.icall resolves the call by displacement instead.
+  initInstancePtr(guestPtr) {
+    if (!this.vtableBase) this.vtableBase = this.guest.u8.length - 65536;
+    this.guest.dv.setBigUint64(guestPtr, BigInt(this.vtableBase), true);
+  }
   createInstance(objIndex, x, y) {
     const obj = this.objects[objIndex];
     const guestPtr = this.guest.alloc(256, 8);
-    this.guest.dv.setBigUint64(guestPtr, BigInt(485259792), true);
+    this.initInstancePtr(guestPtr);
     const inst = {
       id: this.nextInstanceId++,
       objIndex,
@@ -1951,6 +2094,9 @@ class GMRunner {
     this.instances.set(inst.id, inst);
     this.guestPtrMap.set(guestPtr, inst.id);
     this.instanceList.push(inst);
+    // GameMaker runs PreCreate first; objects use it to set up the variables
+    // Create depends on.
+    this.runEvent(inst, "PreCreate");
     this.runEvent(inst, "Create");
     return inst;
   }
@@ -2005,6 +2151,9 @@ class GMRunner {
     }
     this.roomTransitionDepth++;
     try {
+      // Other_5 is "room end" - it has to run while the instances are still
+      // alive, so it goes before the teardown, not after it.
+      for (const i of [...this.instanceList]) if (i.alive && !i.persistent) this.runEvent(i, "Other_5");
       for (const i of this.instanceList) if (i.alive && !i.persistent) i.alive = false;
       this.currentRoom = idx;
       const room = this.rooms[idx];
@@ -2019,6 +2168,9 @@ class GMRunner {
           this.log("roomcc: " + String(e).slice(0, 120));
         }
       }
+      // Other_4 is "room start": every instance exists by now and the room's
+      // own creation code has run.
+      for (const i of [...this.instanceList]) if (i.alive) this.runEvent(i, "Other_4");
     } finally {
       this.roomTransitionDepth--;
     }
@@ -2046,17 +2198,22 @@ class GMRunner {
     const stepping = this._stepping ?? (this._stepping = []);
     stepping.length = 0;
     for (const inst of this.instanceList) if (inst.alive) stepping.push(inst);
+    // Step_1 is begin step and Step_2 end step; GameMaker runs each of them
+    // across every instance before moving on.
+    for (const inst of stepping) if (inst.alive) this.runEvent(inst, "Step_1");
     for (const inst of stepping) {
       if (!inst.alive) continue;
       inst.x += inst.hspeed;
       inst.y += inst.vspeed;
       this.runEvent(inst, "Step");
     }
+    for (const inst of stepping) if (inst.alive) this.runEvent(inst, "Step_2");
     // compact in place: no new array per frame, no filter() garbage
     let w = 0;
     for (const inst of this.instanceList) {
       if (inst.alive) this.instanceList[w++] = inst;
       else {
+        this.runEvent(inst, "CleanUp");
         this.runEvent(inst, "Destroy");
         this.instances.delete(inst.id);
         this.guestPtrMap.delete(inst.guestPtr);
@@ -2135,7 +2292,7 @@ class GMRunner {
   nullInstance() {
     if (!this._nullInst) {
       const guestPtr = this.guest.alloc(256, 8);
-      this.guest.dv.setBigUint64(guestPtr, BigInt(485259792), true);
+      this.initInstancePtr(guestPtr);
       this._nullInst = { id: -1, objIndex: 0, guestPtr, vars: /* @__PURE__ */ new Map(), slots: /* @__PURE__ */ new Map(), x: 0, y: 0, spriteIndex: -1, imageIndex: 0, imageSpeed: 1, depth: 0, visible: true, persistent: false, alive: true, alarms: new Array(12).fill(0), hspeed: 0, vspeed: 0, speed: 0, direction: 0, imageXscale: 1, imageYscale: 1, imageAngle: 0, imageAlpha: 1, imageBlend: 16777215 };
     }
     return this._nullInst;

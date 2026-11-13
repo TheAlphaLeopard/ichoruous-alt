@@ -84,6 +84,9 @@ Instance layout offsets that show up repeatedly:
 | `0x140041a50` | 84565 | release an RValue's value (no-op) |
 | `0x14128ab40` | — | MSVC `_eh_vector_constructor_iterator` |
 | `0x14128aa70` | — | MSVC `_eh_vector_destructor_iterator` |
+| `0x140e851f0` | — | **three-way comparison.** `(RValue *left, RValue *right) -> -1 / 0 / 1` in `rax`. It switches on `kindA*16 + kindB` (capped at `0xf0`, i.e. 15×15) through a compressed jump table; the plain integer case is `cvttsd2si rax,[left] / sub rax,[right] / sar 31 / and -2 / +1`. `-2` means "not comparable". See below: getting this wrong hangs the interpreter. |
+| `0x140042560` | — | **in-place RValue multiply.** `(RValue *dst, RValue *src) -> dst` with `dst = dst * src`; the double case is literally `movsd xmm0,[src] / mulsd xmm0,[dst] / movsd [dst],xmm0`. Only two arguments. |
+| `0x140e645a0` | 255822 | **GMS 2.3 method creation.** `(RValue *out, fn, struct)` sets `out->kind = 6` (object) and points it at a freshly allocated `0xe0`-byte method object tagged `"METH"` (`0x4d455448`), which stores the function at `+0x90`, the bound struct at `+0xa8` (only when non-zero), and the resolved script at `+0xb8`. This is the missing half of the `dispatch: uncallable callee` flood: every anonymous function in the game becomes a method value through here, and none of them can be called until the result is something `callTargetId` recognises. |
 
 ### Call shapes that bite
 
@@ -106,10 +109,53 @@ call. Its `callee` slot has three shapes and has to be resolved before use
   dispatch nonsense;
 * occasionally a raw **code address**.
 
-### Not yet characterised, next in line by call count: `0x14128a900` /
-`0x14128a960` (a paired id allocate/release, both 1052), `0x140e63aa0` (996,
-instance lookup by id — it tests `rcx >= 0x186a0`, the 100000 instance-id
-base), `0x1400462a0` (897), `0x140069500` (808), `0x140041df0` (704).
+### Three shims that were not just wrong but catastrophic
+
+All three of these produced plausible-looking logs and a running frame loop, so
+none of them announced itself. It is worth writing down how each one presented.
+
+**`instance + 0` is a vtable pointer.** Lifted object code does `mov rax,[self]`
+and then calls through it, so whatever sits at an instance's first qword has to
+be a real address inside the 48MB guest image. `createInstance` wrote a
+sentinel, `485259792`, there instead. Every object event then trapped `memory
+access out of bounds` on its first virtual call, with an empty `abiTrace`
+because no import call preceded the fault. It now points at an unread page at
+the top of memory; `abi.icall` resolves calls by displacement, so the slots are
+never actually fetched.
+
+**`0x140e851f0` returns -1/0/1, not a boolean.** Lifted loops compare that way:
+`call 0x140e851f0 / test rax,rax / setl rdi / test rdi,rdi / je <exit>`, which
+is to say *keep looping while the result is negative*. A shim returning `0` or
+`1` makes every `for` and `while` in the game run either zero times or — when
+the comparison is inverted — forever. Fixing it also cleared all eight
+remaining boot failures at a stroke: boot went from 490 ok / 8 threw to
+498 ok / 0 threw.
+
+**`0x140042560` takes two arguments, not three.** The old shim read the third
+as an element count and looped that many times over a destructor thunk it had
+invented. One call site passed `50266112`, so that was 50 million iterations of
+a no-op with *no import call in between* — and because `icall_reg` is called
+directly rather than through the import proxy, the ABI trace showed nothing.
+The whole interpreter hung inside a single wasm frame, where neither the
+watchdog nor the debugger can reach it. When the guest log stops mid-event
+after a burst of import calls, suspect a shim of your own looping, not the
+guest.
+
+### Not yet characterised, next in line by call count
+
+Re-ranked with the frame loop actually running (12 rooms × 20 frames, via
+`tools/room-walk.mjs`), which is a very different picture from the boot-only
+ranking: `0x140041df0` (1081), `0x140486f90` (862), `0x140046040` (805),
+`0x140046500` (480), `0x140041c40` (320), `0x1400419a0` (312), `0x140e8da20`
+(194), `0x140069500` (171), `0x1400462a0` (170), `0x140e98b30` (168),
+`0x140e86c30` (164), `0x14040fdc0` (146), `0x140e78f40` (121), `0x140e78ec0`
+(93), `0x14008e020` (85) — 6419 calls across 149 distinct imports in total.
+Most of the top of the list is the `0x140041xxx`–`0x140046xxx` refcount and
+RValue family, which is the same family as the heap exhaustion below.
+
+Earlier boot-only leaders: `0x14128a900` / `0x14128a960` (a paired id
+allocate/release, both 1052), `0x140e63aa0` (996, instance lookup by id — it
+tests `rcx >= 0x186a0`, the 100000 instance-id base).
 
 ## Tooling
 
@@ -131,6 +177,10 @@ GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --filter=blob:none --no-checkout \
 | `tools/jumptable.mjs <va>` | decodes an MSVC switch table (RValue-kind dispatch is always one) |
 | `tools/builtin-scan.mjs` | recovers `name -> implementation VA` for every built-in GML function from the runner's registration table |
 | `tools/boot-report.mjs` | groups the boot scripts that throw by root cause |
+| `tools/room-walk.mjs [frames] [maxrooms]` | the frame-loop benchmark: enters each room in the game's own order, runs it, and reports instances, draw calls, throws and wall time per room. Measuring only the boot room is useless — `rmInit` holds nothing but managers, so it always reports zero draw calls. |
+| `tools/gex/tmp/one.mjs <fn>` | lifts a **single** function out of the exe into a standalone wasm module, so its behaviour can be studied without booting 107MB of game |
+| `tools/gex/tmp/one-run.mjs` | runs that module against the real shims |
+| `tools/gex/tmp/sweep.mjs <start> <end> <out>` | linear-sweep disassembly that restarts one byte later on an undecodable byte. `tools/disas.mjs` *stops* at inline data — a jump table or a string blob truncates the listing and silently hides the rest of the function, including every loop back-edge |
 
 ### Traps
 
@@ -144,6 +194,49 @@ GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --filter=blob:none --no-checkout \
 * `.data` is larger on disk than in the file (`vsize` 0x48eb14 vs `rawSize`
   0x10c600); everything past the raw part is zero at load, so reads there are
   meaningless.
+* `tools/disas.mjs` stops at the first undecodable byte. Use
+  `tools/gex/tmp/sweep.mjs` when you need a whole function — it is the
+  difference between "no backward jumps, so it cannot loop" and the five
+  back-edges that were actually there.
+* The runner keeps a linked list of `{prev, name}` frames for error reporting,
+  and the head is a `.data` global at `31226448`. Reading it names the *guest*
+  caller of an import, which is the only way to attribute a call when the
+  JavaScript stack is nothing but wasm frames.
+* `pkill -f <pattern>` kills the shell running it when the pattern appears in
+  the command line. It took out a whole turn's harness that way.
+* `/tmp` does not survive between turns. Harnesses worth keeping live in
+  `tools/gex/tmp/`.
+* The guest's own error-reporting frame chain (head at `31226448`) names the
+  caller of an import, but it is only correct while frames are balanced. It
+  blamed `anon@897@…oRogueLevelManager_Other_13` for 255822 method
+  creations that the disassembly of that function shows it cannot possibly
+  make — it has no loop and calls nothing of the kind. Trust the chain for
+  narrow questions, verify with a call count before acting on it.
+
+## Where the frame loop stands
+
+With the event table, the vtable, the comparison and the multiply all fixed:
+
+* boot: **498 scripts ok, 0 threw** (was 490 / 8);
+* `tools/room-walk.mjs 10`: 24 of 75 rooms entered, 15 of them drawing
+  something, mean 1.2 draws/frame, 0 frame throws, 5.8s;
+* working set 607 of 5555 lifted functions (10.9%), RSS 491MB;
+* unimplemented ABI imports: 6419 calls across 149 distinct — most of the top
+  of the list is the `0x140041xxx`–`0x140046xxx` refcount and RValue family.
+
+Two things now stand in the way, and they are separate problems:
+
+**Guest heap exhaustion** stops the walk at room 24 of 75. The heap is a bump
+allocator with an 8MB budget (32505856 → 40894464) and nothing is ever freed,
+because `0x140041a50` and friends are no-ops. One frame of
+`rmSqualorLevelBoss` alone asks for 8MB: 514 instances, 2046500 member reads,
+767447 GML calls, and 255822 method creations, at ~5.4s for the frame. The
+*real* runner survives that because it refcounts; ours cannot.
+
+**`dispatch: uncallable callee`**, 1605 of them over the same walk, is the
+method gap above. The callee slot is an RValue holding either 0.0 (1120) or
+`undefined` (175), and the callers are anonymous struct methods — Scribble's
+`element.get_bbox` accounts for 780 of them on its own.
 
 ## The alternative to hand-shimming
 
