@@ -123,6 +123,7 @@ class GMRunner {
     this.nameToCell = /* @__PURE__ */ new Map();
     this.running = true;
     this.methods = /* @__PURE__ */ new Map();
+    this.methodIntern = /* @__PURE__ */ new Map();
     this.methodSeq = 0;
     this.abiTrace = [];
     this.scopeStack = [];
@@ -147,6 +148,7 @@ class GMRunner {
     this.budgetStart = 0;
     this.budgetTicks = 0;
     this.eventBudgetMs = 250;
+    this.roomBudgetMs = 5000;
     this.logCount = 0;
     this.timeouts = 0;
     this.eventTimeouts = /* @__PURE__ */ new Map();
@@ -215,6 +217,10 @@ class GMRunner {
   // script ran with the watchdog permanently disarmed, and a handler that
   // spun took the whole tab with it instead of being timed out and disabled.
   enterGuest(fn, a, b, c, d, e) {
+    // Runaway recursion burns the JS stack, which V8 reports as an
+    // unrecoverable out-of-memory rather than a catchable stack overflow.
+    // Bounding the depth turns it into an ordinary error.
+    if (this.callDepth >= (this.maxCallDepth ?? 2000)) throw new Error("guest call depth exceeded at " + this.callDepth);
     const top = this.callDepth === 0;
     if (top && this.budgetMs) this.budgetStart = this.now();
     this.callDepth++;
@@ -365,17 +371,17 @@ class GMRunner {
         g.writeRV(rcx, { v: va, flags: 8, t: T_OBJECT });
         return [0, 0];
       }
-      const id = ++self.methodSeq;
-      self.methods.set(id, { fn: f ? f.n : null, va, self: r8 | 0 });
-      // Bound methods need a record, so the map has to stay bounded. Ids are
-      // sequential and the map iterates in insertion order, so the oldest
-      // half can be dropped by id.
-      if (self.methods.size > 1048576) {
-        const cutoff = id - 524288;
-        for (const k of self.methods.keys()) {
-          if (k >= cutoff) break;
-          self.methods.delete(k);
-        }
+      // A bound method needs a record, and the game makes them by the
+      // hundred thousand. Intern on (script, struct): two methods over the
+      // same function and the same struct are interchangeable, so handing
+      // back the same handle collapses a loop that would otherwise add a
+      // fresh entry per iteration and exhaust memory.
+      const key = va + "|" + (r8 | 0);
+      let id = self.methodIntern.get(key);
+      if (id === void 0) {
+        id = ++self.methodSeq;
+        self.methodIntern.set(key, id);
+        self.methods.set(id, { fn: f ? f.n : null, va, self: r8 | 0 });
       }
       g.writeRV(rcx, { v: id, flags: 8, t: T_OBJECT });
       return [0, 0];
@@ -560,6 +566,11 @@ class GMRunner {
     const wrapped = {};
     for (const [k, fn] of Object.entries(impl)) {
       wrapped[k] = (a, b, c, d, e) => {
+        // Every import call is a host boundary, which makes it the only place
+        // a guest loop can be stopped from outside. Checking only in
+        // dispatchFunction left loops that allocate without calling anything
+        // dispatchable free to run until the process ran out of memory.
+        self.checkBudget(k);
         if (self.traceABI) {
           self.abiTrace.push(k + "(" + Number(a) + "," + Number(b) + "," + Number(c) + ")");
           if (self.abiTrace.length > 40) self.abiTrace.shift();
@@ -1009,6 +1020,7 @@ class GMRunner {
   resolveCallee(v) {
     const id = this.callTargetId(v);
     if (id >= 0) return { cell: id };
+    if (this.noMethods) return null;
     const rec = this.resolveMethod(v);
     if (rec) return { method: rec };
     return null;
@@ -2162,10 +2174,19 @@ class GMRunner {
       for (const ri of room.instances) this.createInstance(ri.obj, ri.x, ri.y);
       const cc = this.fnByName.get("gml_RoomCC_" + room.name + "_Create");
       if (cc) {
+        // A room's creation code gets the same treatment as an event
+        // handler. Without it there is nothing to stop a room that spins:
+        // this ran unbounded and allocated until the process was killed,
+        // and no amount of watchdog machinery in the frame loop helps,
+        // because room entry never reaches the frame loop.
+        const outerB = this.budgetMs;
+        if (!outerB) this.budgetMs = this.roomBudgetMs;
         try {
           this.callGuest(cc.n);
         } catch (e) {
           this.log("roomcc: " + String(e).slice(0, 120));
+        } finally {
+          this.budgetMs = outerB;
         }
       }
       // Other_4 is "room start": every instance exists by now and the room's

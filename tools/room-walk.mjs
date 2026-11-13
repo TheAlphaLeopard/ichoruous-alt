@@ -16,9 +16,40 @@ import { GMRunner } from "../js/gex/runtime.js";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const FRAMES = Number(process.argv[2] ?? 30);
 const MAXROOMS = Number(process.argv[3] ?? 1e9);
+const START = Number(process.env.START ?? 0);
+const ONLY = process.env.ROOM ?? null;
 const rb = (p) => { const f = path.join(ROOT, p); try { return gunzipSync(fs.readFileSync(f + ".gz")); } catch { return fs.readFileSync(f); } };
 const rj = (p) => JSON.parse(fs.readFileSync(path.join(ROOT, p), "utf8"));
 const W = (s) => fs.writeSync(1, s + "\n");
+
+// A room that runs away cannot be stopped from inside the process — a loop
+// that never calls the host is invisible to every watchdog — so in isolate
+// mode each room gets its own child process, and one bad room costs one room
+// instead of the whole run.
+if (process.env.ISOLATE) {
+  const { spawnSync } = await import("node:child_process");
+  const self = fileURLToPath(import.meta.url);
+  const order = rj("cartridge/room_order.json");
+  const allRooms = rj("gex/rooms.json");
+  const byName = new Map(allRooms.map((r, i) => [r.name, i]));
+  const list = order.map((o) => byName.get(o.room)).filter((i) => i !== undefined).slice(START, START + MAXROOMS);
+  const chased = /* @__PURE__ */ new Map();
+  let drew = 0, ok = 0, killed = 0;
+  for (const ri of list) {
+    const name = allRooms[ri].name;
+    const r = spawnSync(process.execPath, ["--max-old-space-size=1200", self, String(FRAMES), "1"],
+      { env: { ...process.env, ROOM: name, ISOLATE: "", NO_ABI: "1" }, encoding: "utf8", timeout: 180000 });
+    const line = String(r.stdout ?? "").split("\n").find((l) => l.startsWith("ROOM ")) ?? "";
+    const dead = r.status !== 0 || !line;
+    if (dead) killed++; else { ok++; if ((Number((line.match(/draws=\s*([\d.]+)/) ?? [])[1]) || 0) > 0) drew++; }
+    const tag = dead ? (r.signal === "SIGKILL" || r.status === 137 ? "OUT OF MEMORY" : "exit " + r.status) : line.replace("ROOM ", "");
+    W(`${name.padEnd(28)} ${tag}`);
+    for (const m of String(r.stderr ?? "").matchAll(/^(dispatch: \S+|unimplemented builtin: \S+|runner error: \S+)/gm)) chased.set(m[1], (chased.get(m[1]) ?? 0) + 1);
+  }
+  W(`\n${ok}/${list.length} rooms survived, ${drew} drew something, ${killed} killed`);
+  if (chased.size) { W("\nacross the whole run:"); for (const [k, v] of [...chased].sort((a, b) => b[1] - a[1]).slice(0, 8)) W(`   ${String(v).padStart(6)}  ${k}`); }
+  process.exit(0);
+}
 
 const runner = new GMRunner();
 const logs = new Map();
@@ -57,7 +88,8 @@ W(`boot scripts ${((Date.now() - t0) / 1000).toFixed(1)}s\n`);
 let walkable = 0, drew = 0, totalDraws = 0, totalFrames = 0;
 const errors = new Map();
 const started = Date.now();
-for (const ri of roomOrder.slice(0, MAXROOMS)) {
+const walkList = ONLY !== null ? [idx.get(ONLY)].filter((i) => i !== undefined) : roomOrder.slice(START, START + MAXROOMS);
+for (const ri of walkList) {
   const name = rooms[ri].name;
   const before = runner.instanceList.length;
   let enterMs = -1, threw = 0, draws = 0, maxFrame = 0;
@@ -83,9 +115,9 @@ for (const ri of roomOrder.slice(0, MAXROOMS)) {
   } finally { runner.budgetMs = 0; }
   const heap = ((runner.guest.heapPtr - 32505856) / 1048576).toFixed(1);
   if (process.env.MAPS) W(`      members ${runner.members.size}  dsMaps ${runner.dsMaps.size}  methods ${runner.methods.size}  structIds ${runner.structIds.size}  instances ${runner.instances.size}  slots ${runner.instances.size ? "" : ""}  rss ${(process.memoryUsage().rss / 1048576).toFixed(0)}MB`);
-  W(`${name.padEnd(28)} inst ${String(runner.instanceList.length).padStart(4)}  enter ${String(enterMs).padStart(5)}ms  throws ${String(threw).padStart(3)}  draws/f ${(draws / FRAMES).toFixed(1).padStart(6)}  max ${String(maxFrame).padStart(5)}ms  heap ${heap.padStart(5)}MB`);
+  W((ONLY !== null ? "ROOM " : "") + `${name.padEnd(28)} inst ${String(runner.instanceList.length).padStart(4)}  enter ${String(enterMs).padStart(5)}ms  throws ${String(threw).padStart(3)}  draws=${(draws / FRAMES).toFixed(1).padStart(6)}/f  max ${String(maxFrame).padStart(5)}ms  heap ${heap.padStart(5)}MB`);
 }
-W(`\nrooms entered ${walkable}/${roomOrder.slice(0, MAXROOMS).length}, rooms that drew anything ${drew}, mean draws/frame ${(totalDraws / Math.max(1, totalFrames)).toFixed(1)}, ${((Date.now() - started) / 1000).toFixed(1)}s`);
+W(`\nrooms entered ${walkable}/${walkList.length}, rooms that drew anything ${drew}, mean draws/frame ${(totalDraws / Math.max(1, totalFrames)).toFixed(1)}, ${((Date.now() - started) / 1000).toFixed(1)}s`);
 if (errors.size) {
   W("\nerrors:");
   for (const [k, n] of [...errors].sort((a, b) => b[1] - a[1]).slice(0, 12)) W(`   ${String(n).padStart(5)}  ${k}`);
