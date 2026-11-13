@@ -86,6 +86,7 @@ Instance layout offsets that show up repeatedly:
 | `0x14128aa70` | — | MSVC `_eh_vector_destructor_iterator` |
 | `0x140e851f0` | — | **three-way comparison.** `(RValue *left, RValue *right) -> -1 / 0 / 1` in `rax`. It switches on `kindA*16 + kindB` (capped at `0xf0`, i.e. 15×15) through a compressed jump table; the plain integer case is `cvttsd2si rax,[left] / sub rax,[right] / sar 31 / and -2 / +1`. `-2` means "not comparable". See below: getting this wrong hangs the interpreter. |
 | `0x140042560` | — | **in-place RValue multiply.** `(RValue *dst, RValue *src) -> dst` with `dst = dst * src`; the double case is literally `movsd xmm0,[src] / mulsd xmm0,[dst] / movsd [dst],xmm0`. Only two arguments. |
+| `0x140e645a0` | 255822 | **GMS 2.3 method creation.** `(RValue *out, fn, struct)` sets `out->kind = 6` (object) and points it at a freshly allocated `0xe0`-byte method object tagged `"METH"` (`0x4d455448`), which stores the function at `+0x90`, the bound struct at `+0xa8` (only when non-zero), and the resolved script at `+0xb8`. This is the missing half of the `dispatch: uncallable callee` flood: every anonymous function in the game becomes a method value through here, and none of them can be called until the result is something `callTargetId` recognises. |
 
 ### Call shapes that bite
 
@@ -205,6 +206,37 @@ GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --filter=blob:none --no-checkout \
   the command line. It took out a whole turn's harness that way.
 * `/tmp` does not survive between turns. Harnesses worth keeping live in
   `tools/gex/tmp/`.
+* The guest's own error-reporting frame chain (head at `31226448`) names the
+  caller of an import, but it is only correct while frames are balanced. It
+  blamed `anon@897@…oRogueLevelManager_Other_13` for 255822 method
+  creations that the disassembly of that function shows it cannot possibly
+  make — it has no loop and calls nothing of the kind. Trust the chain for
+  narrow questions, verify with a call count before acting on it.
+
+## Where the frame loop stands
+
+With the event table, the vtable, the comparison and the multiply all fixed:
+
+* boot: **498 scripts ok, 0 threw** (was 490 / 8);
+* `tools/room-walk.mjs 10`: 24 of 75 rooms entered, 15 of them drawing
+  something, mean 1.2 draws/frame, 0 frame throws, 5.8s;
+* working set 607 of 5555 lifted functions (10.9%), RSS 491MB;
+* unimplemented ABI imports: 6419 calls across 149 distinct — most of the top
+  of the list is the `0x140041xxx`–`0x140046xxx` refcount and RValue family.
+
+Two things now stand in the way, and they are separate problems:
+
+**Guest heap exhaustion** stops the walk at room 24 of 75. The heap is a bump
+allocator with an 8MB budget (32505856 → 40894464) and nothing is ever freed,
+because `0x140041a50` and friends are no-ops. One frame of
+`rmSqualorLevelBoss` alone asks for 8MB: 514 instances, 2046500 member reads,
+767447 GML calls, and 255822 method creations, at ~5.4s for the frame. The
+*real* runner survives that because it refcounts; ours cannot.
+
+**`dispatch: uncallable callee`**, 1605 of them over the same walk, is the
+method gap above. The callee slot is an RValue holding either 0.0 (1120) or
+`undefined` (175), and the callers are anonymous struct methods — Scribble's
+`element.get_bbox` accounts for 780 of them on its own.
 
 ## The alternative to hand-shimming
 

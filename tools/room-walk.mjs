@@ -81,7 +81,8 @@ for (const ri of roomOrder.slice(0, MAXROOMS)) {
     const k = "enter: " + String(e.message).slice(0, 90);
     errors.set(k, (errors.get(k) ?? 0) + 1);
   } finally { runner.budgetMs = 0; }
-  W(`${name.padEnd(28)} inst ${String(runner.instanceList.length).padStart(4)} (was ${before})  enter ${String(enterMs).padStart(5)}ms  throws ${String(threw).padStart(3)}  draws/f ${(draws / FRAMES).toFixed(1).padStart(6)}  max ${String(maxFrame).padStart(5)}ms`);
+  const heap = ((runner.guest.heapPtr - 32505856) / 1048576).toFixed(1);
+  W(`${name.padEnd(28)} inst ${String(runner.instanceList.length).padStart(4)}  enter ${String(enterMs).padStart(5)}ms  throws ${String(threw).padStart(3)}  draws/f ${(draws / FRAMES).toFixed(1).padStart(6)}  max ${String(maxFrame).padStart(5)}ms  heap ${heap.padStart(5)}MB`);
 }
 W(`\nrooms entered ${walkable}/${roomOrder.slice(0, MAXROOMS).length}, rooms that drew anything ${drew}, mean draws/frame ${(totalDraws / Math.max(1, totalFrames)).toFixed(1)}, ${((Date.now() - started) / 1000).toFixed(1)}s`);
 if (errors.size) {
