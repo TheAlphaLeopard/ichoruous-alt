@@ -82,6 +82,7 @@ for (const ri of roomOrder.slice(0, MAXROOMS)) {
     errors.set(k, (errors.get(k) ?? 0) + 1);
   } finally { runner.budgetMs = 0; }
   const heap = ((runner.guest.heapPtr - 32505856) / 1048576).toFixed(1);
+  if (process.env.MAPS) W(`      members ${runner.members.size}  dsMaps ${runner.dsMaps.size}  methods ${runner.methods.size}  structIds ${runner.structIds.size}  instances ${runner.instances.size}  slots ${runner.instances.size ? "" : ""}  rss ${(process.memoryUsage().rss / 1048576).toFixed(0)}MB`);
   W(`${name.padEnd(28)} inst ${String(runner.instanceList.length).padStart(4)}  enter ${String(enterMs).padStart(5)}ms  throws ${String(threw).padStart(3)}  draws/f ${(draws / FRAMES).toFixed(1).padStart(6)}  max ${String(maxFrame).padStart(5)}ms  heap ${heap.padStart(5)}MB`);
 }
 W(`\nrooms entered ${walkable}/${roomOrder.slice(0, MAXROOMS).length}, rooms that drew anything ${drew}, mean draws/frame ${(totalDraws / Math.max(1, totalFrames)).toFixed(1)}, ${((Date.now() - started) / 1000).toFixed(1)}s`);

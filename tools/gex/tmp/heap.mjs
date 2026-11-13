@@ -7,6 +7,23 @@ const rb = (p) => { try { return gunzipSync(fs.readFileSync(R + p + ".gz")); } c
 const rj = (p) => JSON.parse(fs.readFileSync(R + p, "utf8"));
 const runner = new GMRunner();
 runner.debugFn = () => {};
+// count the argument shapes of method creation
+const methN = new Map();
+const mk = runner.makeImports.bind(runner);
+runner.makeImports = () => {
+  const p = mk();
+  return new Proxy(p, { get(t, k) {
+    const f = t[k];
+    if (typeof f !== "function") return f;
+    return (...a) => {
+      if (k === "f140e645a0") {
+        const key = "r8=" + (Number(a[2]) ? "struct" : "0") + " rdx=0x" + Number(a[1]).toString(16).slice(0, 6);
+        methN.set(key, (methN.get(key) ?? 0) + 1);
+      }
+      return f(...a);
+    };
+  } });
+};
 await runner.boot(rb("gex/game.wasm"), rb("gex/image.bin"), rj("gex/meta.json"), rj("gex/builtins.json"));
 const HEAD = 31226448;
 const cstr = (p) => { const u = runner.guest.u8; if (!p || p >= u.length) return "?"; let s = ""; for (let i = 0; i < 200 && u[p + i]; i++) s += String.fromCharCode(u[p + i]); return s; };
@@ -59,6 +76,12 @@ for (let f = 0; f < 8; f++) {
   try { runner.stepFrame(); } catch (e) { console.log("frame threw", String(e.message).slice(0, 70)); }
   console.log(`frame ${f}: +${((runner.guest.heapPtr - h0) / 1024).toFixed(0)}KB  ${Date.now() - t}ms  total ${((runner.guest.heapPtr - 32505856) / 1048576).toFixed(2)}MB`);
   if (f === 0) { console.log("   abi calls, this frame:"); for (const [k, v] of counts()) console.log("      " + String(v - (before.get(k) ?? 0)).padStart(8) + "  " + k); }
+}
+{
+  console.log("\nmethod creation shapes:");
+  const tot = [...methN.values()].reduce((s, x) => s + x, 0);
+  for (const [k, v] of [...methN].sort((a, b) => b[1] - a[1]).slice(0, 8)) console.log("   " + String(v).padStart(8) + "  " + k);
+  console.log("   " + String(tot).padStart(8) + "  TOTAL");
 }
 if (process.env.SAMPLE) {
   console.log("\nallocation sites (guest chain, sampled):");

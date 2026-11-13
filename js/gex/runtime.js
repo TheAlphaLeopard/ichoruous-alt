@@ -122,6 +122,8 @@ class GMRunner {
     this.globalVarIds = /* @__PURE__ */ new Map();
     this.nameToCell = /* @__PURE__ */ new Map();
     this.running = true;
+    this.methods = /* @__PURE__ */ new Map();
+    this.methodSeq = 0;
     this.abiTrace = [];
     this.scopeStack = [];
     this.traceABI = false;
@@ -206,6 +208,21 @@ class GMRunner {
       this.callDepth--;
     }
     return { rax: Number(res[0]), xmm0: Number(res[1]) };
+  }
+  // Enter a lifted function with the same bookkeeping callGuest does. The
+  // budget watchdog only arms itself at callDepth 0, and only callGuest used
+  // to move that counter - so a script reached through a call from another
+  // script ran with the watchdog permanently disarmed, and a handler that
+  // spun took the whole tab with it instead of being timed out and disabled.
+  enterGuest(fn, a, b, c, d, e) {
+    const top = this.callDepth === 0;
+    if (top && this.budgetMs) this.budgetStart = this.now();
+    this.callDepth++;
+    try {
+      return fn(a, b, c, d, e);
+    } finally {
+      this.callDepth--;
+    }
   }
   makeImports() {
     const g = this.guest;
@@ -320,19 +337,47 @@ class GMRunner {
     // pointer to an RValue holding a GMS 2.3 method, and occasionally a raw
     // code address - so it has to be resolved before it is dispatched.
     impl.f140e634e0 = (rcx, rdx, r8, r9, rsp) => {
-      self.dispatchFunction(rcx, rdx, r8, r9, self.callTargetId(stackArg(rsp, 4)), stackArg(rsp, 5));
+      self.dispatchFunction(rcx, rdx, r8, r9, stackArg(rsp, 4), stackArg(rsp, 5));
       return [0, 0];
     };
     impl.f140e63610 = (rcx, rdx, r8, r9, rsp) => {
-      self.dispatchFunction(rcx, rdx, r8, r9, self.callTargetId(stackArg(rsp, 4)), stackArg(rsp, 5));
+      self.dispatchFunction(rcx, rdx, r8, r9, stackArg(rsp, 4), stackArg(rsp, 5));
       return [0, 0];
     };
+    // GMS 2.3 method creation: (RValue *out, code address of the script,
+    // struct to bind or 0). The real runner allocates a 0xe0-byte object
+    // tagged "METH" here and stores the script at +0x90 and the struct at
+    // +0xa8. This keeps the record on the JS side instead: the game builds
+    // a quarter of a million of these in a single frame, and nothing in this
+    // shim frees memory, so handing out a real allocation each time is what
+    // exhausted the 8MB guest heap.
     impl.f140e645a0 = (rcx, rdx, r8) => {
-      const p = g.alloc(32, 8);
-      g.dv.setBigUint64(p, BigInt(rdx), true);
-      g.dv.setBigUint64(p + 8, BigInt(r8), true);
-      g.dv.setUint32(p + 16, 1296389192, true);
-      g.writeRV(rcx, { v: p, flags: 8, t: T_OBJECT });
+      // rdx is the script's code address and arrives as an RVA (0xd21190,
+      // not 0x140d21190), so it has to go through fnByPtr rather than being
+      // compared against the image base directly.
+      const f = self.fnByPtr(rdx);
+      const va = f ? f.va : Number(rdx);
+      if (!(r8 | 0) && va >= IMAGE_BASE) {
+        // Unbound: the script's own code address is the payload. Real guest
+        // pointers all live in the 48MB image, so anything at or above the
+        // image base can only be one of these, and the method costs no
+        // memory at all worth speaking of.
+        g.writeRV(rcx, { v: va, flags: 8, t: T_OBJECT });
+        return [0, 0];
+      }
+      const id = ++self.methodSeq;
+      self.methods.set(id, { fn: f ? f.n : null, va, self: r8 | 0 });
+      // Bound methods need a record, so the map has to stay bounded. Ids are
+      // sequential and the map iterates in insertion order, so the oldest
+      // half can be dropped by id.
+      if (self.methods.size > 1048576) {
+        const cutoff = id - 524288;
+        for (const k of self.methods.keys()) {
+          if (k >= cutoff) break;
+          self.methods.delete(k);
+        }
+      }
+      g.writeRV(rcx, { v: id, flags: 8, t: T_OBJECT });
       return [0, 0];
     };
     // `a.b` read where the left-hand side is already an instance pointer: the
@@ -564,7 +609,14 @@ class GMRunner {
     });
   }
   fnByVa(va) {
-    return this.meta.fns.find((f) => f.va === va);
+    // Built lazily on first use. A linear scan is fine for the handful of
+    // resolutions makeImports does, but method creation calls this once per
+    // method and the game makes hundreds of thousands in one frame.
+    if (!this._fnByVa) {
+      this._fnByVa = /* @__PURE__ */ new Map();
+      for (const f of this.meta.fns) this._fnByVa.set(f.va, f);
+    }
+    return this._fnByVa.get(va);
   }
   // Callers sometimes hand us an RVA instead of a full VA (see makeImports).
   fnByPtr(ptr) {
@@ -870,7 +922,7 @@ class GMRunner {
   // object RValue (a pointer) or as the numeric handle the shim handed out.
   structKey(rvPtr) {
     const r = this.guest.readRV(rvPtr);
-    if (r.t === T_OBJECT && r.v) {
+    if (r.t === T_OBJECT && r.v && r.v < IMAGE_BASE && !this.methods.has(r.v)) {
       let id = this.structIds.get(r.v);
       if (id === void 0) {
         id = this.dsNewMap();
@@ -900,14 +952,42 @@ class GMRunner {
     }
     return -1;
   }
-  dispatchFunction(selfPtr, otherPtr, resultPtr, argc, id, argsPtr) {
+  dispatchFunction(selfPtr, otherPtr, resultPtr, argc, callee, argsPtr) {
     try {
       this.checkBudget("dispatch");
-      if (id < 0) {
+      const target = this.resolveCallee(callee);
+      if (!target) {
         this.log("dispatch: uncallable callee");
         this.guest.writeRVUndef(resultPtr);
         return;
       }
+      if (target.method) {
+        const rec = target.method;
+        if (!rec.fn) {
+          this.log("dispatch: method with no script (va 0x" + rec.va.toString(16) + ")");
+          this.guest.writeRVUndef(resultPtr);
+          return;
+        }
+        const fn = this.exports["g_" + rec.fn.replace(/[^A-Za-z0-9_@]/g, "_")];
+        if (!fn) {
+          this.log("dispatch: method script not lifted " + rec.fn);
+          this.guest.writeRVUndef(resultPtr);
+          return;
+        }
+        // A method carries its own `self`: the struct it was bound to, or,
+        // for an unbound function value, whatever the caller was running as.
+        const outerSelf = this.curSelfPtr, outerOther = this.curOtherPtr;
+        const bound = rec.self || selfPtr;
+        try {
+          if (bound) this.curSelfPtr = bound;
+          this.enterGuest(fn, BigInt(bound), BigInt(otherPtr), BigInt(resultPtr), 0n, 0n);
+        } finally {
+          this.curSelfPtr = outerSelf;
+          this.curOtherPtr = outerOther;
+        }
+        return;
+      }
+      const id = target.cell;
       const outerSelf = this.curSelfPtr, outerOther = this.curOtherPtr;
       if (selfPtr) this.curSelfPtr = selfPtr;
       if (otherPtr) this.curOtherPtr = otherPtr;
@@ -918,8 +998,31 @@ class GMRunner {
         this.curOtherPtr = outerOther;
       }
     } catch (e) {
-      this.log("dispatch " + (this.meta.cellNames[id] ?? id) + " threw: " + String(e).slice(0, 120));
+      // A timeout has to keep going. Swallowing it here meant a handler that
+      // spun was never timed out, never disabled, and never stopped: the
+      // cooperative abort exists precisely to unwind out of these frames.
+      if (String(e && e.message).includes("guest timeout")) throw e;
+      this.log("dispatch threw: " + String(e).slice(0, 120));
     }
+  }
+  // What a call site named: either a cell id, or a GMS 2.3 method value.
+  resolveCallee(v) {
+    const id = this.callTargetId(v);
+    if (id >= 0) return { cell: id };
+    const rec = this.resolveMethod(v);
+    if (rec) return { method: rec };
+    return null;
+  }
+  resolveMethod(rvPtr) {
+    const p = rvPtr >>> 0;
+    if (!p || p + 16 > this.guest.u8.length) return null;
+    if ((this.guest.dv.getUint32(p + 12, true) & 16777215) !== T_OBJECT) return null;
+    const v = Number(this.guest.dv.getBigUint64(p, true));
+    if (v >= IMAGE_BASE) {
+      const f = this.fnByVa(v);
+      return f ? { fn: f.n, va: v, self: 0 } : null;
+    }
+    return this.methods.get(v) ?? null;
   }
   dispatchInner(selfPtr, otherPtr, resultPtr, argc, id, argsPtr) {
     {
@@ -941,7 +1044,12 @@ class GMRunner {
       }
       const exportName = "g_" + f.n.replace(/[^A-Za-z0-9_@]/g, "_");
       const fn = this.exports[exportName];
-      fn(BigInt(selfPtr), BigInt(otherPtr), BigInt(resultPtr), 0n, 0n);
+      if (!fn) {
+        this.log("dispatch: no export for " + f.n);
+        this.guest.writeRVUndef(resultPtr);
+        return;
+      }
+      this.enterGuest(fn, BigInt(selfPtr), BigInt(otherPtr), BigInt(resultPtr), 0n, 0n);
     }
   }
   callBuiltin(name, selfPtr, _otherPtr, resultPtr, argc, argsPtr) {
