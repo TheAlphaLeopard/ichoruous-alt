@@ -2,7 +2,10 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const buf = fs.readFileSync(`${HERE}/../../upload/data.win`);
+const DATAWIN = process.env.ICHOROUS_DATAWIN ?? `${HERE}/../../upload/data.win`;
+const OUTDIR = process.env.GEX_OUT ?? path.join(HERE, "..", "..", "gex");
+const META = process.env.GEX_META ?? path.join(HERE, "..", "..", "gex", "meta.json");
+const buf = fs.readFileSync(DATAWIN);
 const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
 let off = 8;
 const chunks = {};
@@ -24,8 +27,14 @@ const readStr = (p) => {
   for (let i = 0; i < n; i++) s += String.fromCharCode(buf[p + i]);
   return s;
 };
-const meta = JSON.parse(fs.readFileSync(`${HERE}/../../public/gex/meta.json`, "utf8"));
+const meta = JSON.parse(fs.readFileSync(META, "utf8"));
 const fnNames = new Set(meta.fns.map((f) => f.n));
+// every lifted object event, gml_Object_<object>_<Kind>[_<sub>]
+const objFnNames = meta.fns.map((f) => f.n).filter((n) => n.startsWith("gml_Object_"));
+// kinds whose <sub> is a subtype rather than an identity, so the bare name is
+// meaningful: Step_1 is "begin step", but Alarm_1 is "alarm 1", not a kind of
+// Alarm.
+const BASE_KINDS = new Set(["Create", "Step", "Draw", "Destroy", "CleanUp", "PreCreate"]);
 const OBJT = chunks.OBJT.off;
 const objCount = dv.getUint32(OBJT, true);
 const objPtrs = [];
@@ -52,45 +61,25 @@ for (const op of objPtrs) {
   const solid = dv.getInt32(op + 12, true) !== 0;
   const depth = dv.getInt32(op + 16, true);
   const persistent = dv.getInt32(op + 20, true) !== 0;
-  let evListPtr = 0;
-  for (let o = 88; o <= 200; o += 4) {
-    const cand = dv.getUint32(op + o, true);
-    if (cand > OBJT && cand < OBJT + chunks.OBJT.len && dv.getUint32(cand, true) <= 16) {
-      let ok = true;
-      const n = dv.getUint32(cand, true);
-      for (let k = 0; k < Math.min(n, 3); k++) {
-        const sub = dv.getUint32(cand + 4 + 4 * k, true);
-        if (!sub || sub < cand || sub > cand + 4096) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok && n > 0) {
-        evListPtr = cand;
-        break;
-      }
-    }
-  }
+  // Events are matched by name, not by structure. meta.json already holds
+  // every object event under its GameMaker name, so probing for the OBJT event
+  // table is unnecessary - and the probe that used to run here found the
+  // Create block and nothing else, leaving 512 of 780 event functions in the
+  // wasm unreachable and stepFrame() dispatching nothing on every frame.
   const events = {};
-  if (evListPtr) {
-    const nTypes = dv.getUint32(evListPtr, true);
-    for (let t = 0; t < nTypes; t++) {
-      const e = dv.getUint32(evListPtr + 4 + 4 * t, true);
-      if (!e) continue;
-      const evType = dv.getUint32(e, true);
-      const count = dv.getUint32(e + 4, true);
-      const listPtr = dv.getUint32(e + 8, true);
-      const evName = EVENT_NAMES[String(evType)] ?? "Ev" + evType;
-      for (let k = 0; k < count; k++) {
-        const ep = dv.getUint32(listPtr + 4 + 4 * k, true);
-        if (!ep) continue;
-        const fnName = "gml_Object_" + name + "_" + evName + "_" + k;
-        if (fnNames.has(fnName)) {
-          (events[evName] ??= []).push(fnName);
-        }
-      }
+  if (name) {
+    const pre = "gml_Object_" + name + "_";
+    for (const fn of objFnNames) {
+      if (!fn.startsWith(pre)) continue;
+      const m = /^([A-Za-z]+)(?:_(\d+))?$/.exec(fn.slice(pre.length));
+      if (!m) continue;
+      const kind = m[1];
+      const sub = m[2];
+      if (sub !== undefined) (events[kind + "_" + sub] ??= []).push(fn);
+      if (BASE_KINDS.has(kind) && (sub === undefined || sub === "0")) (events[kind] ??= []).push(fn);
     }
   }
+  void fnNames;
   objects.push({ name, sprite, visible, solid, depth, persistent, events });
 }
 console.log("objects:", objects.length);
@@ -146,6 +135,7 @@ console.log("rooms:", rooms.length);
 console.log("room0:", JSON.stringify(rooms[0]).slice(0, 300));
 const totalInst = rooms.reduce((a, r) => a + r.instances.length, 0);
 console.log("total room instances:", totalInst);
-fs.writeFileSync(`${HERE}/../../public/gex/objects.json`, JSON.stringify(objects));
-fs.writeFileSync(`${HERE}/../../public/gex/rooms.json`, JSON.stringify(rooms));
+fs.mkdirSync(OUTDIR, { recursive: true });
+fs.writeFileSync(path.join(OUTDIR, "objects.json"), JSON.stringify(objects));
+fs.writeFileSync(path.join(OUTDIR, "rooms.json"), JSON.stringify(rooms));
 console.log("wrote objects.json, rooms.json");

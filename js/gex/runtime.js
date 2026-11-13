@@ -1,5 +1,8 @@
 const IMAGE_BASE = 5368709120;
+// RValue kinds, from the runner's kind table at 0x140e4abe8. GameMaker stores
+// an operand's kind in the low 24 bits of the fourth word of the RValue.
 const T_DOUBLE = 0, T_STRING = 1, T_ARRAY = 2, T_PTR = 3, T_BOOL = 4, T_UNDEF = 5, T_OBJECT = 6, T_INT32 = 7;
+const T_VEC3 = 8, T_VEC4 = 9, T_INT64 = 10, T_ACCESSOR = 11, T_NULL = 12, T_INT_BOOL = 13;
 class Guest {
   constructor() {
     this.heapPtr = 32505856;
@@ -280,21 +283,37 @@ class GMRunner {
       else d = g.dv.getFloat64(rcx, true);
       return [0, d];
     };
-    impl.f140e851f0 = (rcx, rdx, _r8, r9) => {
+    // Three-way comparison: rcx is the left operand, rdx the right, and the
+    // result is -1, 0 or 1 in rax - not a boolean. Lifted `for` and `while`
+    // loops test `rax < 0` afterwards (the sign of a subtraction), so a shim
+    // that returned a boolean made them run either zero times or forever.
+    impl.f140e851f0 = (rcx, rdx) => {
       try {
-        const opSel = r9 | 0;
-        const a = g.readRV(rdx);
-        if (a.t === T_STRING) {
-          g.u8.copyWithin(rcx, rdx, rdx + 16);
-          return [0, 0];
+        const a = g.readRV(rcx), b = g.readRV(rdx);
+        if (a.t === T_STRING && b.t === T_STRING) {
+          const x = g.readString(a.v), y = g.readString(b.v);
+          return [x < y ? -1 : x > y ? 1 : 0, 0];
         }
-        const av = self.rvToNum(a);
-        if (opSel === 0) g.u8.copyWithin(rcx, rdx, rdx + 16);
-        else g.writeRVDouble(rcx, -av);
+        const x = self.rvToNum(a), y = self.rvToNum(b);
+        return [x < y ? -1 : x > y ? 1 : 0, 0];
       } catch (e) {
-        self.log("unaryop: " + String(e).slice(0, 80));
+        self.log("compare: " + String(e).slice(0, 80));
       }
       return [0, 0];
+    };
+    // RValue multiply in place: (dst, src) -> dst = dst * src, returning dst.
+    // The real function switches on the kind of its first argument and has no
+    // third argument at all; reading one as a count made it loop 50 million
+    // times over a destructuring thunk it had invented, which hung the whole
+    // interpreter inside a single wasm frame where nothing could interrupt it.
+    impl.f140042560 = (rcx, rdx) => {
+      const a = self.rvToNum(g.readRV(rcx)), b = self.rvToNum(g.readRV(rdx));
+      const v = a * b;
+      const t = rvType(rcx);
+      if (t === T_INT32) g.dv.setInt32(rcx, Math.trunc(v) | 0, true);
+      else if (t === T_INT64) g.dv.setBigUint64(rcx, BigInt(Math.trunc(v)), true);
+      else g.writeRVDouble(rcx, v);
+      return [rcx, 0];
     };
     // Call a GML function: (self, other, RValue *result, argc, callee, args).
     // The callee slot has three shapes - a plain cell id for a built-in, a
@@ -356,9 +375,14 @@ class GMRunner {
     };
     impl.icall = (vtbl, selfP, disp, rcx, rdx, r8, r9) => {
       void vtbl;
+      void selfP;
       void r8;
       void r9;
-      return self.vtableCall(selfP, disp, rcx, rdx);
+      // rcx is `this` - a Windows x64 member call always passes the object in
+      // rcx. selfP, the base register of the call's memory operand, is the
+      // vtable pointer, and using it as the instance sent every object through
+      // unknownInst() and so into one shared set of variable slots.
+      return self.vtableCall(rcx, disp, rcx, rdx);
     };
     // Resolve an indirect call target. The guest stores some function pointers
     // as RVAs (offsets from the image base) rather than full VAs, so a bare
@@ -1918,10 +1942,21 @@ class GMRunner {
     for (const i of this.instanceList) if (i.alive && this.matchesObject(i, t)) return true;
     return false;
   }
+  // Lifted object code reads [instance] as a vtable pointer and calls through
+  // it, so it has to be a real address inside the guest memory: the constant
+  // this replaced, 485259792, is nearly ten times past the end of it, and the
+  // load of the call target trapped on the first virtual call of every object
+  // event. The last page of memory is free - the stack grows down from 46MB
+  // and the heap grows up from about 31MB - and the slots are never read,
+  // because abi.icall resolves the call by displacement instead.
+  initInstancePtr(guestPtr) {
+    if (!this.vtableBase) this.vtableBase = this.guest.u8.length - 65536;
+    this.guest.dv.setBigUint64(guestPtr, BigInt(this.vtableBase), true);
+  }
   createInstance(objIndex, x, y) {
     const obj = this.objects[objIndex];
     const guestPtr = this.guest.alloc(256, 8);
-    this.guest.dv.setBigUint64(guestPtr, BigInt(485259792), true);
+    this.initInstancePtr(guestPtr);
     const inst = {
       id: this.nextInstanceId++,
       objIndex,
@@ -1951,6 +1986,9 @@ class GMRunner {
     this.instances.set(inst.id, inst);
     this.guestPtrMap.set(guestPtr, inst.id);
     this.instanceList.push(inst);
+    // GameMaker runs PreCreate first; objects use it to set up the variables
+    // Create depends on.
+    this.runEvent(inst, "PreCreate");
     this.runEvent(inst, "Create");
     return inst;
   }
@@ -2005,6 +2043,9 @@ class GMRunner {
     }
     this.roomTransitionDepth++;
     try {
+      // Other_5 is "room end" - it has to run while the instances are still
+      // alive, so it goes before the teardown, not after it.
+      for (const i of [...this.instanceList]) if (i.alive && !i.persistent) this.runEvent(i, "Other_5");
       for (const i of this.instanceList) if (i.alive && !i.persistent) i.alive = false;
       this.currentRoom = idx;
       const room = this.rooms[idx];
@@ -2019,6 +2060,9 @@ class GMRunner {
           this.log("roomcc: " + String(e).slice(0, 120));
         }
       }
+      // Other_4 is "room start": every instance exists by now and the room's
+      // own creation code has run.
+      for (const i of [...this.instanceList]) if (i.alive) this.runEvent(i, "Other_4");
     } finally {
       this.roomTransitionDepth--;
     }
@@ -2046,17 +2090,22 @@ class GMRunner {
     const stepping = this._stepping ?? (this._stepping = []);
     stepping.length = 0;
     for (const inst of this.instanceList) if (inst.alive) stepping.push(inst);
+    // Step_1 is begin step and Step_2 end step; GameMaker runs each of them
+    // across every instance before moving on.
+    for (const inst of stepping) if (inst.alive) this.runEvent(inst, "Step_1");
     for (const inst of stepping) {
       if (!inst.alive) continue;
       inst.x += inst.hspeed;
       inst.y += inst.vspeed;
       this.runEvent(inst, "Step");
     }
+    for (const inst of stepping) if (inst.alive) this.runEvent(inst, "Step_2");
     // compact in place: no new array per frame, no filter() garbage
     let w = 0;
     for (const inst of this.instanceList) {
       if (inst.alive) this.instanceList[w++] = inst;
       else {
+        this.runEvent(inst, "CleanUp");
         this.runEvent(inst, "Destroy");
         this.instances.delete(inst.id);
         this.guestPtrMap.delete(inst.guestPtr);
@@ -2135,7 +2184,7 @@ class GMRunner {
   nullInstance() {
     if (!this._nullInst) {
       const guestPtr = this.guest.alloc(256, 8);
-      this.guest.dv.setBigUint64(guestPtr, BigInt(485259792), true);
+      this.initInstancePtr(guestPtr);
       this._nullInst = { id: -1, objIndex: 0, guestPtr, vars: /* @__PURE__ */ new Map(), slots: /* @__PURE__ */ new Map(), x: 0, y: 0, spriteIndex: -1, imageIndex: 0, imageSpeed: 1, depth: 0, visible: true, persistent: false, alive: true, alarms: new Array(12).fill(0), hspeed: 0, vspeed: 0, speed: 0, direction: 0, imageXscale: 1, imageYscale: 1, imageAngle: 0, imageAlpha: 1, imageBlend: 16777215 };
     }
     return this._nullInst;
