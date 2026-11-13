@@ -33,10 +33,10 @@ runner.renderer = { drawSprite: () => {}, clear: () => {}, rect: () => {}, circl
 runner.audio = { play: () => {}, stop: () => {}, stopAll: () => {} };
 const g = runner.createInstance(Math.max(0, objects.findIndex((o) => o.name === "__InputUpdateController")), 0, 0);
 runner.globalInstPtr = g.guestPtr;
-runner.extraEvents = { pre: !!process.env.EV_PRE, step1: !!process.env.EV_STEP1, step2: !!process.env.EV_STEP2, cleanup: !!process.env.EV_CLEANUP, other: !!process.env.EV_OTHER };
 const t = new Map(), n = new Map();
 let budget = 300000, stop = false;
 let SEQ = 0; const T0 = performance.now();
+const THROWS = {}, OK = {};
 let TOTAL = 0;
 const origEvent = runner.runEvent.bind(runner);
 const slowest = [];
@@ -51,12 +51,15 @@ runner.runEvent = (inst, ev) => {
     ABI_CAP = Number(process.env.ABI_CAP ?? 400);
   }
   if (process.env.EV_LOG && seq % Number(process.env.EV_LOG) === 0) console.error("  seq " + seq + " " + nm + "." + ev);
+  THROWS[ev.replace(/_\d+$/, "")] ??= 0; OK[ev.replace(/_\d+$/, "")] ??= 0;
   if (seq % 4000 === 0) console.log("  ..event " + seq + " " + nm + "." + ev + " t=" + (performance.now() - T0).toFixed(0));
   const a = performance.now();
-  try { return origEvent(inst, ev); }
+  let threw = false;
+  try { return origEvent(inst, ev); } catch (e) { threw = true; THROWS[ev.replace(/_\d+$/, "")]++; throw e; }
   finally {
     const d = performance.now() - a;
     t.set(kind, (t.get(kind) ?? 0) + d); n.set(kind, (n.get(kind) ?? 0) + 1);
+    if (!threw) OK[ev.replace(/_\d+$/, "")]++;
     if (d > 50) slowest.push([d, ev, runner.objects[inst.objIndex]?.name ?? "?"]);
     if (process.env.EV_TRACE && nm + "." + ev === process.env.EV_TRACE) console.error("TRACE done " + nm + "." + ev + " " + d.toFixed(0) + "ms");
     if (--budget <= 0 && !stop) { stop = true; throw new Error("event budget exhausted"); }
@@ -65,7 +68,7 @@ runner.runEvent = (inst, ev) => {
 const A = performance.now();
 try { runner.gotoRoom(idx.get("rmInit")); } catch (e) { console.log("gotoRoom threw:", String(e).slice(0, 100)); }
 console.log("gotoRoom", (performance.now() - A).toFixed(0) + "ms", "instances", runner.instanceList.length);
-for (let f = 0; f < 20; f++) {
+for (let f = 0; f < 30; f++) {
   const a = performance.now();
   try { runner.stepFrame(); } catch (e) { console.log("frame " + f + " threw:", String(e).slice(0, 100)); break; }
   const d = performance.now() - a;
@@ -74,6 +77,8 @@ for (let f = 0; f < 20; f++) {
 }
 console.log("\n  kind      count    total ms");
 for (const k of [...t.keys()].sort((a, b) => t.get(b) - t.get(a))) console.log("   " + k.padEnd(11) + String(n.get(k)).padStart(7) + "  " + t.get(k).toFixed(0).padStart(9));
+console.log("\n  kind        ran   threw");
+for (const k of new Set([...Object.keys(OK), ...Object.keys(THROWS)])) console.log("   " + k.padEnd(11) + String(OK[k] ?? 0).padStart(7) + String(THROWS[k] ?? 0).padStart(8));
 slowest.sort((a, b) => b[0] - a[0]);
 console.log("\nslowest single events:");
 for (const [d, ev, nm] of slowest.slice(0, 8)) console.log("   " + d.toFixed(0).padStart(7) + "ms  " + nm + "." + ev);
