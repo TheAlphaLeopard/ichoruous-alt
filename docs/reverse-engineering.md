@@ -242,6 +242,35 @@ something kills it. The only defences are structural — terminate the worker
 stack and V8 reports that as an unrecoverable out-of-memory rather than a
 catchable stack overflow.
 
+## Reading an unimplemented ABI import
+
+Every import in `gex/game.wasm` is declared `(i64, i64, i64, i64, i64) ->
+(i64, f64)`. Five raw registers in, integer result in slot 0 and the xmm0
+result in slot 1. Two consequences that are easy to get wrong:
+
+* A shim receives **raw 64-bit register values**. Whether that is a pointer,
+  a cell id, or the bit pattern of a double is up to the function — the
+  disassembly is the only way to tell, and guessing has produced wrong shims
+  before. For a float function the i64 has to be reinterpreted as an f64; for
+  `f140e851f0` (which compares with `comisd` in the original) the arguments are
+  RValue *pointers*, not doubles, despite the x86 being pure floating point.
+* `tools/gex/tmp/abiargs.mjs` logs real calls with arguments decoded — RValues
+  shown by kind and value, small integers resolved to their cell name. Log
+  before implementing.
+
+Measured signatures for the imports the browser console reports most:
+
+| import | observed args | reading |
+| ------ | ------------- | ------- |
+| `f140e78ec0` | `(rv, rv, rv)` | leaf body is `maxsd; minsd; movaps; ret`, so `clamp` — but the arguments arrive as RValue pointers, which contradicts the leaf body, so it needs more than a disassembly to pin down |
+| `f140e794b0` | `(rv, rv, 0x80000000, rv)` | `comisd` then a `subsd` loop: real `mod` |
+| `f140e162c50` | `(rv, rv, 0x80000000, rv)` | switches on the RValue kind at `rcx+0xc` with cases for double, string, int32, int64 and bool, and an error path otherwise — a numeric conversion like `YYGetInt64`. It is being called with `T_UNDEF`, which the real runner rejects |
+| `f140e78db0` | `(out, rv, rv, rv)` | zeroes `rcx` first (`[rcx+0xc]` then `[rcx]`), so `rcx` is the output RValue; then branches on whether `rdx` is 0 |
+| `f140e98b30` | `(rv, rv, cell, 271568)` | third argument is a function-name cell (`ds_stack`, `ds_queue`), so a two-argument call through a named function |
+
+None of these are implemented yet. They are logged here because the shape is
+half the work and re-deriving it costs a disassembler run each time.
+
 ## Where the frame loop stands
 
 Methods are the most recent piece: `0x140e645a0` is implemented, and an
