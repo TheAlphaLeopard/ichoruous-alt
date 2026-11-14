@@ -255,13 +255,34 @@ See `docs/port-status.md` for the current measurements. As of this writing:
 498 boot scripts with none throwing, 72 of 75 rooms survivable, 61 of them
 drawing, 5.4 draw calls per frame on average.
 
-**The three tutorial rooms run away**, and they run away somewhere the
-runner cannot see. Counting ABI imports from inside `checkBudget` during
-`rmTutorial2`'s entry: none at all, for twenty seconds, while the process grows
-until the OS kills it. Raising the heap limit to 2.5 GB changes nothing, so it
-is not a question of headroom. A loop that allocates inside lifted wasm and
-never calls the host is invisible to every mechanism above — no budget check,
-no three-strikes, no worker termination short of the OS. It builds a struct, binds a method to it, and repeats; every
+**The three tutorial rooms run away**, and they run away somewhere the runner
+cannot see. `rmTutorial2`'s entry gets through about 1600 ABI imports and then
+stops making them entirely — fewer than 100 in the next twenty seconds — while
+process RSS climbs roughly 300 MB/s until the OS kills it. Wasm linear memory
+stays flat at 48 MB, so it is not `memory.grow`. A 2.5 GB heap changes nothing,
+and neither does a small `--stack-size`, which would have turned runaway
+recursion into a catchable `RangeError` — so it is a loop, and it never reaches
+a host boundary. No budget check, no three-strikes, and no worker termination
+short of the OS can stop it.
+
+The measurement is worth keeping: `tools/gex/tmp/tutwatch.mjs` runs the entry
+on a worker thread so the main thread's timers keep firing during a
+synchronous guest loop. It is the only way to watch a runaway that makes no
+host calls, which is exactly the case that is hardest to see into.
+
+**Two leads that looked like the cause and are not.** Recording them so they
+are not re-chased.
+
+The lifted wasm for `gml_Object_oMeatBlob_Create_0` contains **1803 `loop`
+blocks**, and a linear sweep of the original x86 (0x140b51d20–0x140b53aa0)
+finds **zero backward jumps** in 133 of them. That reads like the lifter
+inventing loops that are not there — but `gml_Object_oWall_PreCreate_0`, which
+runs fine, lifts to **2544 loops from 4 backward jumps**. The loops are how
+this lifter encodes conditional regions generally, not a per-loop bug, so the
+count is not the discriminator.
+
+There is also no direct self-call: `oMeatBlob`'s Create has 534 `call`s across
+69 distinct targets and none is itself. So it is not simple recursion either. It builds a struct, binds a method to it, and repeats; every
 struct is a fresh allocation, so nothing can be reused. It fails identically
 with method dispatch switched off.
 

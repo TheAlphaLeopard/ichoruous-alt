@@ -66,6 +66,26 @@ Create event completes in about a millisecond when run on its own
 sitting a few megabytes under the heap limit — the instrument was OOMing, not
 the game.
 
+Measured properly (`tools/gex/tmp/tutwatch.mjs`, which runs the entry on a
+worker thread so the main thread's timers keep firing during a synchronous
+guest loop):
+
+* the entry gets through ~1600 ABI imports and then stops making them
+  entirely — fewer than 100 in the next twenty seconds;
+* process RSS climbs about **300 MB/s** (650 MB → 3.7 GB before the kill);
+* **wasm linear memory stays flat at 48 MB**, so this is not `memory.grow`,
+  even though the module declares its memory with no maximum;
+* it is the OS that kills it, and neither a 2.5 GB heap nor a small
+  `--stack-size` changes the outcome — a small stack would have turned
+  runaway recursion into a catchable `RangeError`, so it is a loop.
+
+For comparison, a healthy room's entry takes 71 ms and 3741 import calls.
+
+Bounding the whole room entry (below) does not rescue it either: the budget is
+checked at the host boundary, and this loop does not reach one. The only
+defences that work are structural — terminate the worker, and skip the room on
+the next run.
+
 **Structs and methods are never freed.** This is the root cause and the next
 piece of real work. The guest heap is a bump allocator with an 8 MB budget and
 the decref shims are no-ops, so every `@@NewGMLObject@@` and every bound method
@@ -94,6 +114,13 @@ in order:
    host at all — cannot be stopped from inside the process. `js/main.js`
    terminates the worker, and `room-walk.mjs --isolate` gives each room its own
    process.
+
+**Room entry after the first was completely unbounded.** `boot.js` sets a
+budget around the very first `gotoRoom`, but every later room change comes from
+the game's own `room_goto` inside the frame loop, where `budgetMs` is 0 — and
+`checkBudget` returns immediately when it is. So a runaway Create event during
+any room after the first ran with no bound at all. The budget now covers the
+whole entry rather than just the room's own creation code.
 
 Two bugs had been defeating all of this, and are worth remembering because
 they are invisible until something spins: `callDepth` was only incremented by

@@ -2177,6 +2177,13 @@ class GMRunner {
       return;
     }
     this.roomTransitionDepth++;
+    // The whole entry is bounded, not just the room's own creation code.
+    // boot.js sets a budget around the first gotoRoom, but every later room
+    // change comes from the game's own room_goto inside the frame loop, where
+    // budgetMs is 0 - and checkBudget does nothing when it is. So a runaway
+    // Create event during any room after the first ran completely unbounded.
+    const outerB = this.budgetMs;
+    if (!outerB) this.budgetMs = this.roomBudgetMs;
     try {
       // Other_5 is "room end" - it has to run while the instances are still
       // alive, so it goes before the teardown, not after it.
@@ -2189,25 +2196,19 @@ class GMRunner {
       for (const ri of room.instances) this.createInstance(ri.obj, ri.x, ri.y);
       const cc = this.fnByName.get("gml_RoomCC_" + room.name + "_Create");
       if (cc) {
-        // A room's creation code gets the same treatment as an event
-        // handler. Without it there is nothing to stop a room that spins:
-        // this ran unbounded and allocated until the process was killed,
-        // and no amount of watchdog machinery in the frame loop helps,
-        // because room entry never reaches the frame loop.
-        const outerB = this.budgetMs;
-        if (!outerB) this.budgetMs = this.roomBudgetMs;
+        // The room's own creation code runs under the entry budget set
+        // above, like any other handler.
         try {
           this.callGuest(cc.n);
         } catch (e) {
           this.log("roomcc: " + String(e).slice(0, 120));
-        } finally {
-          this.budgetMs = outerB;
         }
       }
       // Other_4 is "room start": every instance exists by now and the room's
       // own creation code has run.
       for (const i of [...this.instanceList]) if (i.alive) this.runEvent(i, "Other_4");
     } finally {
+      this.budgetMs = outerB;
       this.roomTransitionDepth--;
     }
   }

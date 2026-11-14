@@ -26,11 +26,32 @@ runner.globalInstPtr = g.guestPtr;
 for (const f of runner.meta.fns.filter((f) => f.n.startsWith("gml_GlobalScript_"))) {
   try { runner.budgetMs = 3000; runner.callGuest(f.n, g.guestPtr, 0, runner.guest.alloc(16, 16), 0); } catch {} finally { runner.budgetMs = 0; }
 }
+// Phase tracing: append to a file so the last marker survives an OOM kill.
+const TRACEF = process.env.TRACEF;
+const T = (s) => { if (TRACEF) fs.appendFileSync(TRACEF, s + "\n"); };
+if (TRACEF) {
+  const ore = runner.runEvent.bind(runner);
+  runner.runEvent = (inst, ev) => { T("  runEvent " + (inst && inst.objName) + " " + ev); return ore(inst, ev); };
+  const oci = runner.createInstance.bind(runner);
+  runner.createInstance = (o, x, y) => { T("  createInstance " + (objects[o] && objects[o].name)); return oci(o, x, y); };
+  const ocg = runner.callGuest.bind(runner);
+  runner.callGuest = (nm, ...a) => { T("  callGuest " + nm); return ocg(nm, ...a); };
+  const oeg = runner.enterGuest.bind(runner);
+  runner.enterGuest = (fn, ...a) => { T("  enterGuest " + (fn && fn.name)); return oeg(fn, ...a); };
+  const ocb2 = runner.callBuiltin.bind(runner);
+  runner.callBuiltin = function (nm, ...a) {
+    if (nm === "array_create") T("  array_create arg=" + runner.rvToNum(runner.guest.readRV(a[3])));
+    return ocb2(nm, ...a);
+  };
+  const odi = runner.dispatchInner.bind(runner);
+  runner.dispatchInner = (...a) => { T("  dispatchInner id=" + a[4] + " (" + runner.meta.cellNames[a[4]] + ")"); return odi(...a); };
+}
 let n = 0; let live = false;
 const MOD = Number(process.env.MOD ?? 500000);
 const cb = runner.checkBudget.bind(runner);
 runner.checkBudget = (k) => {
   if (live && ++n % MOD === 0) {
+    if (TRACEF) fs.appendFileSync(TRACEF, "  [imports " + n + "]\n");
     W(`  [${n / 1000 | 0}k] rss ${(process.memoryUsage().rss / 1048576) | 0}MB heap ${(process.memoryUsage().heapUsed / 1048576) | 0}MB  dsMaps ${runner.dsMaps.size} methods ${runner.methods.size} members ${runner.members.size} instances ${runner.instances.size} list ${runner.instanceList.length} structs ${runner.structIds.size} guestHeap ${((runner.guest.heapPtr - 32505856) / 1048576).toFixed(1)}MB depth ${runner.callDepth}`);
   }
   return cb(k);
