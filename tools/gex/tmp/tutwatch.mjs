@@ -10,7 +10,7 @@ const ROOM = process.argv[2] ?? "rmTutorial2";
 const self = new URL(import.meta.url).pathname;
 
 if (isMainThread) {
-  const w = new Worker(self, { argv: [ROOM], resourceLimits: { maxOldGenerationSizeMb: 2048 } });
+  const w = new Worker(self, { argv: [ROOM], resourceLimits: { maxOldGenerationSizeMb: Number(process.env.WCAP ?? 2048) } });
   w.on("message", (m) => console.log("[worker]", m));
   w.on("exit", (c) => console.log("[worker] exit " + c));
   const t0 = Date.now();

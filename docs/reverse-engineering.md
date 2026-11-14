@@ -268,7 +268,21 @@ short of the OS can stop it.
 The measurement is worth keeping: `tools/gex/tmp/tutwatch.mjs` runs the entry
 on a worker thread so the main thread's timers keep firing during a
 synchronous guest loop. It is the only way to watch a runaway that makes no
-host calls, which is exactly the case that is hardest to see into. It builds a struct, binds a method to it, and repeats; every
+host calls, which is exactly the case that is hardest to see into.
+
+**Two leads that looked like the cause and are not.** Recording them so they
+are not re-chased.
+
+The lifted wasm for `gml_Object_oMeatBlob_Create_0` contains **1803 `loop`
+blocks**, and a linear sweep of the original x86 (0x140b51d20–0x140b53aa0)
+finds **zero backward jumps** in 133 of them. That reads like the lifter
+inventing loops that are not there — but `gml_Object_oWall_PreCreate_0`, which
+runs fine, lifts to **2544 loops from 4 backward jumps**. The loops are how
+this lifter encodes conditional regions generally, not a per-loop bug, so the
+count is not the discriminator.
+
+There is also no direct self-call: `oMeatBlob`'s Create has 534 `call`s across
+69 distinct targets and none is itself. So it is not simple recursion either. It builds a struct, binds a method to it, and repeats; every
 struct is a fresh allocation, so nothing can be reused. It fails identically
 with method dispatch switched off.
 

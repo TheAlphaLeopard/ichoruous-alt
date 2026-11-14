@@ -36,6 +36,15 @@ if (TRACEF) {
   runner.createInstance = (o, x, y) => { T("  createInstance " + (objects[o] && objects[o].name)); return oci(o, x, y); };
   const ocg = runner.callGuest.bind(runner);
   runner.callGuest = (nm, ...a) => { T("  callGuest " + nm); return ocg(nm, ...a); };
+  const oeg = runner.enterGuest.bind(runner);
+  runner.enterGuest = (fn, ...a) => { T("  enterGuest " + (fn && fn.name)); return oeg(fn, ...a); };
+  const ocb2 = runner.callBuiltin.bind(runner);
+  runner.callBuiltin = function (nm, ...a) {
+    if (nm === "array_create") T("  array_create arg=" + runner.rvToNum(runner.guest.readRV(a[3])));
+    return ocb2(nm, ...a);
+  };
+  const odi = runner.dispatchInner.bind(runner);
+  runner.dispatchInner = (...a) => { T("  dispatchInner id=" + a[4] + " (" + runner.meta.cellNames[a[4]] + ")"); return odi(...a); };
 }
 let n = 0; let live = false;
 const MOD = Number(process.env.MOD ?? 500000);
