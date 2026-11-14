@@ -82,6 +82,7 @@ class GMRunner {
     this.objects = [];
     this.rooms = [];
     this.roomOrder = [];
+    this.roomSkip = /* @__PURE__ */ new Set();
     this.currentRoom = -1;
     this.globalVars = /* @__PURE__ */ new Map();
     this.builtinFnNames = /* @__PURE__ */ new Set();
@@ -2154,6 +2155,20 @@ class GMRunner {
   gotoRoom(idx) {
     if (idx === void 0 || idx < 0 || idx >= this.rooms.length) {
       this.log("room_goto: bad room " + idx);
+      return;
+    }
+    // A room that hangs cannot be interrupted, only survived: the page
+    // watchdog terminates the worker and reloads, and on the next run this
+    // steps over the room that did it. Without it the game reaches a bad
+    // room, hangs, reloads, reaches it again, and gives up permanently.
+    if (this.roomSkip && this.roomSkip.has(this.rooms[idx].name)) {
+      const pos = this.roomOrder ? this.roomOrder.indexOf(idx) : -1;
+      const next = pos >= 0 ? this.roomOrder[pos + 1] : void 0;
+      this.log("room_goto: skipping " + this.rooms[idx].name + " (hung on an earlier run)");
+      if (next !== void 0 && next !== idx) {
+        this.gotoRoom(next);
+        return;
+      }
       return;
     }
     if (this.roomTransitionDepth > 4) {

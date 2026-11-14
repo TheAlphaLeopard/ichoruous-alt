@@ -255,8 +255,13 @@ See `docs/port-status.md` for the current measurements. As of this writing:
 498 boot scripts with none throwing, 72 of 75 rooms survivable, 61 of them
 drawing, 5.4 draw calls per frame on average.
 
-**The three tutorial rooms run away**, all in the same `oMeatBlob`
-constructor. It builds a struct, binds a method to it, and repeats; every
+**The three tutorial rooms run away**, and they run away somewhere the
+runner cannot see. Counting ABI imports from inside `checkBudget` during
+`rmTutorial2`'s entry: none at all, for twenty seconds, while the process grows
+until the OS kills it. Raising the heap limit to 2.5 GB changes nothing, so it
+is not a question of headroom. A loop that allocates inside lifted wasm and
+never calls the host is invisible to every mechanism above — no budget check,
+no three-strikes, no worker termination short of the OS. It builds a struct, binds a method to it, and repeats; every
 struct is a fresh allocation, so nothing can be reused. It fails identically
 with method dispatch switched off.
 

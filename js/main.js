@@ -256,7 +256,7 @@ async function startWorker() {
           (m.logs ? ` · ${m.logs} guest messages` : "") +
           (m.timeouts ? ` · ${m.timeouts} timeouts` : "") +
           (m.disabled ? ` · ${m.disabled} events disabled` : "");
-        noteActivity();
+        noteActivity(m.at ?? undefined);
         break;
       case "log":
         console.log("[gex]", m.message);

@@ -49,11 +49,22 @@ out, and 0.1 draw calls per frame.
 ## What is known to be broken
 
 **The three tutorial rooms run away.** `rmTutorial1`, `rmTutorial2` and
-`rmTutorial3` never finish creating their instances. The loop is in an
-`oMeatBlob` constructor: it builds a struct, binds a method to it, and repeats,
-and since every struct is a fresh allocation nothing can be reused. It fails
-identically with method dispatch switched off, so it is not caused by the
-method work — it is the struct lifetime problem below, arriving early.
+`rmTutorial3` never finish entering. Measured on `rmTutorial2` with
+`tools/gex/tmp/tut.mjs`, which counts ABI imports from inside `checkBudget`:
+
+* the entry makes **zero** host import calls — not one in twenty seconds;
+* it is killed by the OS (exit 137), not by V8, and raising
+  `--max-old-space-size` to 2.5 GB does not help;
+* so the loop is entirely inside lifted guest wasm, allocating without ever
+  crossing into the host.
+
+That last point is why none of the watchdog work can touch it, and it is worth
+being precise about because it is easy to misread as a leak in the runner. An
+earlier note blamed an `oMeatBlob` constructor; that was wrong. `oMeatBlob`'s
+Create event completes in about a millisecond when run on its own
+(`tools/gex/tmp/exp.mjs`). The attribution came from a harness that was itself
+sitting a few megabytes under the heap limit — the instrument was OOMing, not
+the game.
 
 **Structs and methods are never freed.** This is the root cause and the next
 piece of real work. The guest heap is a bump allocator with an 8 MB budget and

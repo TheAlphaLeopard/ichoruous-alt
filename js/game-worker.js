@@ -75,6 +75,10 @@ self.onmessage = async (e) => {
         logs: r.logCount,
         timeouts: r.timeouts,
         disabled: r.disabledFns.size,
+        // The page watchdog names whatever it was doing last when it fires.
+        // During play that is a room, not a boot script, and reporting it is
+        // what lets the skip list recover from a hang in one.
+        at: r.rooms[r.currentRoom]?.name ?? null,
       }),
       onError: (err) => post({ type: "log", message: "frame threw: " + String(err && err.message).slice(0, 200) }),
     });
