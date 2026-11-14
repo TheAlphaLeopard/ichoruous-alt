@@ -1786,9 +1786,18 @@ class GMRunner {
           outI(id);
         }
         return;
-      case "@@NewGMLObject@@":
-        outI(this.dsNewMap());
+      case "@@NewGMLObject@@": {
+        // A struct is an object, not a ds_map. Handing back a ds_map handle
+        // keyed struct fields by a small integer, but dot-access resolves its
+        // left-hand side through resolveTargetKey, which hands member storage
+        // a guest pointer - so the two never met. Measured over 12 rooms:
+        // 2815 structs created, 2 of them with any member stored, which is
+        // why a struct holding a method reads back as 0 and the callee is
+        // "uncallable". It also leaked one host ds_map per struct literal.
+        const p = g.alloc(32, 16);
+        g.writeRV(resultPtr, { v: p, flags: 8, t: T_OBJECT });
         return;
+      }
       case "is_array":
         outB(this.hostArrays.has(g.readRV(arg(0)).v));
         return;
@@ -1805,6 +1814,11 @@ class GMRunner {
       case "sprite_get_height": {
         const s = this.sprites[num(0) | 0];
         outD(s?.h ?? 0);
+        return;
+      }
+      case "sprite_get_name": {
+        const s = this.sprites[num(0) | 0];
+        outS(s?.name ?? "");
         return;
       }
       case "sprite_get_uvs":
