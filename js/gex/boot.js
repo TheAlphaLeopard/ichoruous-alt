@@ -187,6 +187,9 @@ export async function createGame({ canvas, audio, onProgress = () => {}, skipLis
   const roomIdxByName = new Map(art.rooms.map((r, i) => [r.name, i]));
   const order = art.roomOrder.map((ro) => roomIdxByName.get(ro.room)).filter((i) => i !== undefined);
   runner.loadWorld(sprites, art.objects, art.rooms, order, art.game.sounds.map((s) => s.name));
+  // The skip list holds whatever the watchdog last blamed. Boot scripts and
+  // rooms never share a name prefix, so one list serves both.
+  for (const n of skipList) runner.roomSkip.add(n);
 
   // renderer: canvas 2d, sprite origins handled the way GameMaker draws them
   const ctx = canvas.getContext("2d", { alpha: false });

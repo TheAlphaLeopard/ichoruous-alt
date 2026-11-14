@@ -34,8 +34,10 @@ runner.audio = { play: () => {}, stop: () => {}, stopAll: () => {} };
 const g = runner.createInstance(Math.max(0, objects.findIndex((o) => o.name === "__InputUpdateController")), 0, 0);
 runner.globalInstPtr = g.guestPtr;
 for (const f of runner.meta.fns.filter((f) => f.n.startsWith("gml_GlobalScript_"))) {
-  try { runner.budgetMs = 3000; runner.callGuest(f.n, g.guestPtr, 0, runner.guest.alloc(16, 16), 0); } catch {} finally { runner.budgetMs = 0; }
+  try { runner.budgetMs = 3000; runner.callGuest(f.n, g.guestPtr, 0, runner.guest.alloc(16, 16), 0); } catch {} finally { runner.noMethods = !!process.env.NO_METHODS;
+runner.budgetMs = 0; }
 }
+runner.noMethods = !!process.env.NO_METHODS;
 runner.budgetMs = 0;
 runner.traceABI = true;
 // trap the runaway: after N method dispatches in one frame, throw so the
@@ -61,7 +63,32 @@ runner.resolveMethod = (p) => {
   if (++mc > LIM) { throw new Error("METHOD DISPATCH LIMIT at " + p); }
   return rm(p);
 };
-runner.gotoRoom(idx.get("rmSqualorLevelBoss"));
+let ci = 0;
+const oci = runner.createInstance.bind(runner);
+runner.createInstance = (o, x, y) => { if (true) console.error(`  createInstance ${ci} obj=${objects[o]?.name}`); return oci(o, x, y); };
+let NA = 0;
+const site = new Map();
+const oalloc = runner.dsNewMap.bind(runner);
+runner.dsNewMap = () => {
+  if (process.env.SAMPLE_ALLOC) {
+    if (++NA % 2000 === 0) {
+      const st = String(new Error().stack).split("\n").slice(2, 6).map((l) => l.trim().replace(/^at /, "")).join(" | ").slice(0, 150);
+      site.set(st, (site.get(st) ?? 0) + 1);
+      if (NA % 40000 === 0) { console.error(`  [dsNewMap ${NA} rss ${(process.memoryUsage().rss / 1048576).toFixed(0)}MB]`); for (const [k, v] of [...site].sort((x, y) => y[1] - x[1]).slice(0, 2)) console.error("      " + v + "  " + k); }
+    }
+    return oalloc();
+  }
+  if (++NA % 200 === 0) {
+    const st = String(new Error().stack).split("\n").slice(2, 7).map((l) => l.trim().replace(/^at /, "")).join(" | ").slice(0, 170);
+    site.set(st, (site.get(st) ?? 0) + 1);
+    if (NA % 2000 === 0) {
+      console.error(`  [${NA} allocs, ${(process.memoryUsage().rss / 1048576).toFixed(0)}MB rss]`);
+      for (const [k, v] of [...site].sort((x, y) => y[1] - x[1]).slice(0, 3)) console.error("      " + v + "  " + k);
+    }
+  }
+  return oalloc();
+};
+runner.gotoRoom(idx.get(process.env.ROOM ?? "rmSqualorLevelBoss"));
 console.log("entered, instances", runner.instanceList.length);
 for (let i = 0; i < 3; i++) {
   CALLS = 0; mc = 0;
